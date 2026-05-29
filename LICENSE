@@ -1,0 +1,4 @@
+Apache License 2.0 — see https://www.apache.org/licenses/LICENSE-2.0
+Copyright the mrc-fabric authors.
+Includes adaptations of segment-routing/srv6-mrc-emulator (Apache-2.0)
+for the SONiC switch configuration generator.

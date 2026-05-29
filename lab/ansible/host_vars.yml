@@ -1,0 +1,3 @@
+# Tenant addresses, picked up by deploy_agents.yml.
+host00: { tenant_addr: "2001:db8:cccc:00::2" }
+host01: { tenant_addr: "2001:db8:cccc:01::2" }

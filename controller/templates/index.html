@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MRC Controller</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{--bg:#0a0c10;--panel:#11151c;--panel2:#0d1117;--line:#1d2530;--ink:#c9d4e0;
+    --dim:#5e6b7a;--amber:#ffb000;--cyan:#3fe0d0;--red:#ff4d5e;--good:#3fe0d0;--grid:#121821;}
+  *{box-sizing:border-box} html,body{margin:0;height:100%}
+  body{background:radial-gradient(1200px 600px at 70% -10%,#11202a 0%,transparent 60%),var(--bg);
+    color:var(--ink);font-family:"IBM Plex Mono",monospace;font-size:13px;background-attachment:fixed}
+  body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
+    background-image:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);
+    background-size:34px 34px;mask:radial-gradient(1000px 700px at 50% 30%,#000 30%,transparent 90%)}
+  .wrap{max-width:1180px;margin:0 auto;padding:22px 24px 40px}
+  header{display:flex;align-items:flex-end;justify-content:space-between;border-bottom:1px solid var(--line);padding-bottom:14px;margin-bottom:18px}
+  .brand{font-family:"Chakra Petch",sans-serif;font-weight:700;letter-spacing:.18em;font-size:22px;color:#fff}
+  .brand b{color:var(--amber)} .sub{color:var(--dim);font-size:11px;margin-top:4px}
+  .pills{display:flex;gap:8px} .pill{border:1px solid var(--line);border-radius:2px;padding:5px 9px;font-size:11px;
+    letter-spacing:.08em;text-transform:uppercase;color:var(--dim);background:var(--panel)}
+  .pill b{color:var(--cyan)} .pill.state b{color:var(--amber)} .pill.mp b{color:var(--amber)}
+  .grid{display:grid;grid-template-columns:1.55fr 1fr;gap:18px}
+  .card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:4px}
+  .card>h2{font-family:"Chakra Petch",sans-serif;font-weight:500;letter-spacing:.16em;font-size:11px;
+    text-transform:uppercase;color:var(--dim);margin:0;padding:11px 14px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between}
+  .card .body{padding:14px} svg{width:100%;height:auto;display:block}
+  .node rect{fill:#0e141b;stroke:var(--line);stroke-width:1.4}
+  .node text{fill:var(--ink);font-size:10px} .node .u{fill:var(--cyan);font-size:9px}
+  .node.src rect{stroke:var(--amber)} .lnk{stroke:#26303c;stroke-width:2;fill:none}
+  .lnk.active{stroke:var(--amber);filter:drop-shadow(0 0 5px rgba(255,176,0,.5))}
+  .lnk.deny{stroke:var(--red);stroke-dasharray:4 5;opacity:.45}
+  .pkt{fill:var(--amber);filter:drop-shadow(0 0 5px var(--amber))}
+  .bps{fill:var(--cyan);font-size:9px;font-weight:600}
+  .tstrip{display:flex;gap:14px;align-items:center;margin-top:6px;padding-top:12px;border-top:1px solid var(--line);flex-wrap:wrap}
+  .tstrip .big{font-family:"Chakra Petch",sans-serif;font-size:26px;color:var(--cyan);font-weight:700}
+  .tstrip .lbl{color:var(--dim);font-size:10px;letter-spacing:.1em;text-transform:uppercase}
+  .tstrip input{width:80px;background:var(--panel2);border:1px solid var(--line);color:var(--ink);
+    font-family:inherit;padding:4px 6px;border-radius:2px}
+  .modeline{color:var(--dim);font-size:10px;margin-top:6px}
+  .modes{display:flex;gap:6px;margin-bottom:12px}
+  .modes button{flex:1;background:var(--panel2);border:1px solid var(--line);color:var(--dim);padding:9px 6px;
+    border-radius:3px;cursor:pointer;font-family:inherit;font-size:11px;letter-spacing:.06em;transition:.15s}
+  .modes button:hover{border-color:#33414f;color:var(--ink)}
+  .modes button.on{border-color:var(--cyan);color:#04130f;background:var(--cyan);font-weight:600}
+  .mdesc{color:var(--dim);font-size:10.5px;line-height:1.5;margin:-4px 0 12px;min-height:30px}
+  .flow{color:var(--dim);font-size:11px;margin-bottom:10px}.flow b{color:var(--ink)}
+  .path{border:1px solid var(--line);border-radius:3px;padding:10px 11px;margin-bottom:9px;background:var(--panel2);transition:.15s}
+  .path.active{border-color:var(--amber);box-shadow:inset 0 0 0 1px rgba(255,176,0,.22)}
+  .path .top{display:flex;justify-content:space-between;align-items:center}
+  .path .name{font-weight:600;letter-spacing:.06em} .path.active .name{color:var(--amber)}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:6px}
+  .dot.good{background:var(--good);box-shadow:0 0 6px var(--good)} .dot.deny{background:var(--red);box-shadow:0 0 6px var(--red)}
+  .btns{display:flex;gap:5px}
+  .tg{font-size:9.5px;letter-spacing:.06em;border:1px solid var(--line);background:transparent;color:var(--dim);padding:3px 8px;border-radius:2px;cursor:pointer}
+  .tg.spray.on{border-color:var(--amber);color:var(--amber)} .tg.deny-btn:hover{border-color:var(--red);color:var(--red)}
+  .chips{margin:8px 0 6px;display:flex;gap:4px;flex-wrap:wrap;align-items:center}
+  .chip{font-size:10px;border:1px solid var(--line);border-radius:2px;padding:2px 6px;color:var(--ink)}
+  .arr{color:#33414f} .meta{display:flex;justify-content:space-between;color:var(--dim);font-size:10.5px}
+  .meta .usid{color:#8ea0b2;word-break:break-all} .meta .bw{color:var(--cyan)}
+  .active-ev{margin-top:6px;padding:11px;border:1px dashed var(--line);border-radius:3px;background:#0b0f15}
+  .active-ev .k{color:var(--dim);font-size:10px;letter-spacing:.1em;text-transform:uppercase}
+  .active-ev .row{color:var(--amber);font-size:13px;font-weight:600;word-break:break-all;margin-top:4px}
+  pre{background:#0b0f15;border:1px solid var(--line);border-radius:3px;padding:12px;color:#9fb0c0;font-size:11px;
+    line-height:1.5;overflow:auto;max-height:300px;margin:0}
+  .feed{color:var(--dim);font-size:10.5px;margin-top:8px}.feed code{color:var(--cyan)}
+  .json-key{color:var(--amber)}.json-str{color:var(--cyan)}.json-num{color:#e0b0ff}
+</style></head>
+<body><div class="wrap">
+  <header>
+    <div><div class="brand">MRC <b>//</b> CONTROLLER</div>
+      <div class="sub">topology-driven EV-profile manager · uSID source routing · multipath</div></div>
+    <div class="pills"><span class="pill">block <b id="p-block">—</b></span>
+      <span class="pill">mode <b id="p-mode">—</b></span>
+      <span class="pill mp" id="p-mp-pill" style="display:none">multipath <b id="p-mp">—</b></span>
+      <span class="pill state">profile <b id="p-state">—</b></span></div>
+  </header>
+  <div class="grid">
+    <div class="card"><h2><span>Fabric · spine / leaf · live throughput</span><span id="t-model" style="color:#3b4654"></span></h2>
+      <div class="body"><svg id="topo" viewBox="0 0 880 430"></svg>
+        <div class="tstrip">
+          <div><div class="lbl">aggregate</div><div class="big"><span id="t-total">0</span> <span style="font-size:13px">Gbps</span></div></div>
+          <div><div class="lbl">paths in spray</div><div class="big" style="color:var(--amber)"><span id="t-n">0</span></div></div>
+          <div><div class="lbl">offered rate (Gbps)</div><input id="t-offer" type="number" min="1" step="10"></div>
+        </div>
+        <div class="modeline" id="t-split"></div>
+      </div></div>
+    <div class="card"><h2>EV format profile</h2><div class="body">
+      <div class="modes" id="modes"></div><div class="mdesc" id="mdesc"></div>
+      <div class="flow" id="flow"></div><div id="paths"></div>
+      <div class="active-ev"><div class="k">active EV set (sprayed)</div><div id="ev-list"></div></div>
+    </div></div>
+  </div>
+  <div class="card" style="margin-top:18px"><h2>Served profile · GET /api/profile</h2><div class="body">
+    <pre id="profile">…</pre>
+    <div class="feed">client: <code>rocebench --client &lt;dst&gt; --proto mrc --ev-mode &lt;m&gt; --controller http://&lt;host&gt;:9810</code></div>
+  </div></div>
+</div>
+<script>
+let TOPO=null,PATHS=null,PROFILE=null,TELEM=null,POS={};
+const lk=(a,b)=>[a,b].sort().join("|");
+async function load(){TOPO=await (await fetch("/api/topology")).json();await refresh();drawModes();
+  document.getElementById("t-offer").onchange=e=>post("/api/profile",{offered_gbps:parseFloat(e.target.value)});}
+async function refresh(){
+  const pj=await (await fetch("/api/paths")).json();PATHS=pj.paths;window.MODES=pj.modes;
+  PROFILE=await (await fetch("/api/profile")).json();
+  TELEM=await (await fetch("/api/telemetry")).json();render();}
+async function post(p,b){PROFILE=await (await fetch(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)})).json();
+  const pj=await (await fetch("/api/paths")).json();PATHS=pj.paths;TELEM=await (await fetch("/api/telemetry")).json();render();}
+async function tick(){if(!TOPO)return;try{TELEM=await (await fetch("/api/telemetry")).json();drawTopo();drawTelem();}catch(e){}}
+function layout(){POS={};const W=880;
+  const row=(arr,y)=>{const n=arr.length;arr.forEach((x,i)=>{POS[x.name]={x:(W*(i+1)/(n+1))-34,y,w:68,h:34,label:x.name,usid:x.usid};});};
+  row(TOPO.spines,40);row(TOPO.leaves,210);
+  const n=TOPO.hosts.length;TOPO.hosts.forEach((h,i)=>{POS[h.name]={x:(W*(i+1)/(n+1))-30,y:360,w:60,h:34,label:h.name,host:true};});}
+function ctr(n){const p=POS[n];return p?{x:p.x+p.w/2,y:p.y+p.h/2}:null;}
+function activeChains(){return PATHS.filter(p=>PROFILE.active_paths.includes(p.id)&&p.status==="good").map(p=>p.segments_nodes);}
+function drawTopo(){
+  const svg=document.getElementById("topo"),ns="http://www.w3.org/2000/svg";svg.innerHTML="";layout();
+  const chains=activeChains();
+  const aset=new Set();chains.forEach(c=>{for(let i=0;i<c.length-1;i++){aset.add(c[i]+">"+c[i+1]);aset.add(c[i+1]+">"+c[i]);}});
+  const denyset=new Set();PATHS.filter(p=>p.status==="deny").forEach(p=>{const c=p.segments_nodes;
+    for(let i=0;i<c.length-1;i++){denyset.add(c[i]+">"+c[i+1]);denyset.add(c[i+1]+">"+c[i]);}});
+  const src=PROFILE.flow.src;
+  TOPO.links.forEach(([a,b])=>{const ca=ctr(a),cb=ctr(b);if(!ca||!cb)return;
+    const bps=TELEM?TELEM.links[lk(a,b)]||0:0;
+    const ln=document.createElementNS(ns,"line");ln.setAttribute("x1",ca.x);ln.setAttribute("y1",ca.y);
+    ln.setAttribute("x2",cb.x);ln.setAttribute("y2",cb.y);let cls="lnk";
+    if(denyset.has(a+">"+b))cls+=" deny";else if(aset.has(a+">"+b))cls+=" active";
+    ln.setAttribute("class",cls);
+    if(aset.has(a+">"+b)){const off=TELEM?TELEM.offered_gbps:100;ln.setAttribute("stroke-width",(2+4.5*Math.min(1,bps/off)).toFixed(1));}
+    svg.appendChild(ln);
+    if(bps>0.1){const t=document.createElementNS(ns,"text");t.setAttribute("x",(ca.x+cb.x)/2+6);t.setAttribute("y",(ca.y+cb.y)/2-3);
+      t.setAttribute("class","bps");t.textContent=bps.toFixed(0)+"G";svg.appendChild(t);}});
+  chains.forEach(c=>{const pts=c.map(ctr).filter(Boolean);if(pts.length<2)return;
+    const pkt=document.createElementNS(ns,"circle");pkt.setAttribute("r","3.5");pkt.setAttribute("class","pkt");svg.appendChild(pkt);
+    const am=document.createElementNS(ns,"animateMotion");am.setAttribute("dur","1.8s");am.setAttribute("repeatCount","indefinite");
+    am.setAttribute("path","M "+pts.map(p=>p.x+" "+p.y).join(" L "));pkt.appendChild(am);});
+  Object.entries(POS).forEach(([name,p])=>{const g=document.createElementNS(ns,"g");
+    g.setAttribute("class","node"+(name===src?" src":""));
+    const r=document.createElementNS(ns,"rect");r.setAttribute("x",p.x);r.setAttribute("y",p.y);
+    r.setAttribute("width",p.w);r.setAttribute("height",p.h);r.setAttribute("rx",3);g.appendChild(r);
+    const t=document.createElementNS(ns,"text");t.setAttribute("x",p.x+p.w/2);t.setAttribute("y",p.y+(p.usid?15:21));
+    t.setAttribute("text-anchor","middle");t.textContent=p.label;g.appendChild(t);
+    if(p.usid){const u=document.createElementNS(ns,"text");u.setAttribute("x",p.x+p.w/2);u.setAttribute("y",p.y+27);
+      u.setAttribute("text-anchor","middle");u.setAttribute("class","u");u.textContent=":"+p.usid;g.appendChild(u);}
+    svg.appendChild(g);});}
+function drawTelem(){if(!TELEM)return;
+  document.getElementById("t-total").textContent=TELEM.total_gbps.toFixed(0);
+  document.getElementById("t-n").textContent=TELEM.n_active;
+  document.getElementById("t-model").textContent=TELEM.model;
+  const off=document.getElementById("t-offer");if(document.activeElement!==off)off.value=TELEM.offered_gbps;
+  const sp=Object.entries(TELEM.per_path).map(([id,g])=>`${id}: <span style="color:var(--cyan)">${g.toFixed(0)}G</span>`).join("  ·  ");
+  document.getElementById("t-split").innerHTML=sp?("split → "+sp):"";}
+function drawModes(){const el=document.getElementById("modes");el.innerHTML="";
+  Object.keys(window.MODES).forEach(m=>{const b=document.createElement("button");b.textContent=m.toUpperCase();
+    b.dataset.m=m;b.onclick=()=>post("/api/profile",{mode:m});el.appendChild(b);});}
+function render(){
+  document.getElementById("p-mode").textContent=PROFILE.mode.toUpperCase();
+  document.getElementById("p-state").textContent=PROFILE.state.toUpperCase();
+  document.getElementById("p-block").textContent=PROFILE.usid_block;
+  const mpPill=document.getElementById("p-mp-pill");
+  mpPill.style.display=PROFILE.multipath?"":"none";document.getElementById("p-mp").textContent=PROFILE.active_paths.length+" paths";
+  [...document.querySelectorAll("#modes button")].forEach(b=>b.classList.toggle("on",b.dataset.m===PROFILE.mode));
+  document.getElementById("mdesc").textContent=window.MODES[PROFILE.mode]||"";
+  const f=PROFILE.flow;document.getElementById("flow").innerHTML=`flow: <b>${f.src}</b> <span class="arr">→</span> <b>${f.dst}</b> &nbsp;(${f.dst_addr||""})`;
+  const pe=document.getElementById("paths");pe.innerHTML="";
+  PATHS.forEach(p=>{const active=PROFILE.active_paths.includes(p.id);const d=document.createElement("div");d.className="path"+(active?" active":"");
+    const chips=p.segments_nodes.map(s=>`<span class="chip">${s}</span>`).join('<span class="arr">→</span>');
+    const bw=TELEM&&TELEM.per_path[p.id]?TELEM.per_path[p.id].toFixed(0)+"G":(active?"…":"idle");
+    d.innerHTML=`<div class="top"><span class="name"><span class="dot ${p.status}"></span>${p.id}</span>
+      <div class="btns"><button class="tg spray ${active?'on':''}">${active?'● spray':'+ spray'}</button>
+      <button class="tg deny-btn">${p.status==='good'?'deny':'restore'}</button></div></div>
+      <div class="chips">${chips}</div>
+      <div class="meta"><span class="usid">${p.usid}</span><span><span class="bw">${bw}</span> · EV ${p.entropy}</span></div>`;
+    d.querySelector(".spray").onclick=()=>post(`/api/path/${p.id}/active`,{active:!active});
+    d.querySelector(".deny-btn").onclick=()=>post(`/api/path/${p.id}/status`,{status:p.status==='good'?'deny':'good'});
+    pe.appendChild(d);});
+  const evl=document.getElementById("ev-list");
+  evl.innerHTML=PROFILE.active_evs.length?PROFILE.active_evs.map(e=>`<div class="row">${e.usid} <span style="color:var(--cyan);font-size:11px">· EV ${e.entropy}</span></div>`).join(""):'<div class="row" style="color:var(--dim)">— none —</div>';
+  const js=JSON.stringify(PROFILE,null,2).replace(/("[^"]+"):/g,'<span class="json-key">$1</span>:')
+    .replace(/: ("[^"]*")/g,': <span class="json-str">$1</span>').replace(/: (\d+\.?\d*)/g,': <span class="json-num">$1</span>');
+  document.getElementById("profile").innerHTML=js;drawTopo();drawTelem();}
+load();setInterval(tick,1500);setInterval(refresh,8000);
+</script></body></html>

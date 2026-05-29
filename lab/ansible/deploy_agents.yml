@@ -1,0 +1,33 @@
+---
+# Install + start mrc-agent on each fabric host (containerlab base ubuntu:22.04).
+# Hosts have no python, so we use the `raw` module exclusively.
+- name: mrc-agent on hosts
+  hosts: hosts
+  gather_facts: false
+  tasks:
+    - name: ensure deps (iproute2 + python3 + curl)
+      raw: |
+        if ! command -v ip >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+          apt-get update -qq >/dev/null 2>&1
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            iproute2 iputils-ping python3 python3-minimal curl procps >/dev/null 2>&1
+        fi
+      changed_when: false
+    - name: place mrc-agent
+      raw: cat > /usr/local/bin/mrc-agent && chmod +x /usr/local/bin/mrc-agent
+      args: { stdin: "{{ lookup('file', '../../agent/mrc-agent') }}" }
+      changed_when: true
+    - name: stop previous
+      raw: pkill -9 -f 'mrc-agent run' 2>/dev/null; sleep 1; true
+      changed_when: false
+    - name: start mrc-agent (nohup)
+      raw: |
+        nohup /usr/local/bin/mrc-agent run \
+          --host {{ inventory_hostname }} \
+          --controller http://172.20.18.213:9810 \
+          --tenant {{ tenant_addr }} \
+          --underlay eth1 \
+          >/var/log/mrc-agent.log 2>&1 &
+        sleep 1
+        pgrep -f 'mrc-agent run' >/dev/null && echo OK || (echo FAIL; tail /var/log/mrc-agent.log)
+      changed_when: false

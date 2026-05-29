@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.tar
+*.tar.gz
+.DS_Store
+.vscode/
+.idea/
+*.swp
+clab-*/
+*.log
+/lab/generated/

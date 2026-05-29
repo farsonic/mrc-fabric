@@ -1,0 +1,18 @@
+# Drop into /etc/systemd/system/mrc-agent.service on an MRC-capable host.
+# Edit the Environment= line for this host's values, then:
+#   systemctl daemon-reload && systemctl enable --now mrc-agent
+[Unit]
+Description=MRC virtual NIC agent (subscribes to the fabric controller)
+After=network.target
+
+[Service]
+Type=simple
+Environment=HOST=host00 CONTROLLER=http://172.20.18.213:9810 \
+            TENANT=2001:db8:cccc:00::2 UNDERLAY=eth1
+ExecStart=/usr/local/bin/mrc-agent run --host ${HOST} --controller ${CONTROLLER} \
+          --tenant ${TENANT} --underlay ${UNDERLAY}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

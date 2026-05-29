@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""
+mrc-agent — the host-side virtual NIC for an MRC-capable endpoint.
+
+Maintains a persistent SSE subscription to the mrc-fabric controller and
+programs the host dataplane to match the served EV profile in real time:
+
+  - lifecycle of the `mrc0` dummy interface (the host's tenant identity surface)
+  - the host's tenant IPv6 address lives on mrc0 (decoupled from any underlay)
+  - seg6 encap routes to peer tenant addresses (single-path OR ECMP multipath)
+  - L4 multipath hashing sysctl
+  - posts eth0/eth1 byte counters back to the controller for real telemetry
+
+Any application sending to a peer tenant address picks up the agent's current
+state — apps stay MRC-unaware; the agent is the MRC endpoint.
+
+Usage:
+  mrc-agent run --host host00 --controller http://172.20.18.213:9810 \\
+                --tenant 2001:db8:cccc:00::2 --underlay eth1
+  mrc-agent show         # current EV profile + installed routes + metrics
+  mrc-agent test         # one-shot connection test against the controller
+"""
+import argparse, json, os, signal, socket, subprocess, sys, threading, time
+from urllib import request as urlreq, error as urlerr
+
+DEFAULT_IFACE   = "mrc0"
+METRICS_PERIOD  = 1.0     # seconds between metric POSTs
+RECONNECT_BASE  = 1.0     # seconds; exponential backoff capped below
+RECONNECT_CAP   = 30.0
+
+def run(cmd, check=False, capture=False):
+    """Run a shell command; never raises on nonzero unless check=True."""
+    r = subprocess.run(cmd, shell=isinstance(cmd, str),
+                       stdout=subprocess.PIPE if capture else None,
+                       stderr=subprocess.PIPE if capture else None,
+                       text=True)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"cmd failed ({r.returncode}): {cmd}\n{r.stderr}")
+    return r
+
+# ---- dataplane ops ---------------------------------------------------------
+class Dataplane:
+    """Owns mrc0 + the encap routes to peer tenant addresses."""
+    def __init__(self, iface, tenant_addr, underlay, dry_run=False):
+        self.iface = iface
+        self.tenant = tenant_addr
+        self.underlay = underlay
+        self.dry = dry_run
+        self.installed_route_dst = None     # last /128 we programmed
+        self.installed_segs = []            # list of uSID stacks currently routed
+
+    def _ip(self, args):
+        cmd = ["ip"] + args
+        if self.dry:
+            print("[dry] " + " ".join(cmd)); return 0
+        r = run(cmd, capture=True)
+        if r.returncode != 0:
+            sys.stderr.write(f"[ip] {' '.join(args)} -> {r.returncode}: {r.stderr.strip()}\n")
+        return r.returncode
+
+    def bring_up(self):
+        """Create mrc0 if missing, set up, place the tenant address on it."""
+        if self.dry:
+            for c in [["link", "add", self.iface, "type", "dummy"],
+                      ["link", "set", self.iface, "up"],
+                      ["-6", "addr", "replace", f"{self.tenant}/128", "dev", self.iface]]:
+                self._ip(c)
+            print(f"[dp:dry] {self.iface} up, tenant {self.tenant}/128, underlay={self.underlay}")
+            return
+        # idempotent create
+        if run(["ip", "link", "show", self.iface], capture=True).returncode != 0:
+            self._ip(["link", "add", self.iface, "type", "dummy"])
+        self._ip(["link", "set", self.iface, "up"])
+        # Move the tenant address onto mrc0 (idempotent: replace).
+        self._ip(["-6", "addr", "replace", f"{self.tenant}/128", "dev", self.iface])
+        # ECMP across seg6 nexthops needs L4 hashing.
+        run("sysctl -w net.ipv6.fib_multipath_hash_policy=1 >/dev/null 2>&1", capture=True)
+        print(f"[dp] {self.iface} up, tenant {self.tenant}/128, underlay={self.underlay}")
+
+    def tear_down(self):
+        self._ip(["-6", "addr", "del", f"{self.tenant}/128", "dev", self.iface])
+        self._ip(["link", "del", self.iface])
+
+    def program(self, peer_dst, usid_stacks):
+        """Replace the encap route to peer_dst with the given uSID stack(s).
+        One stack -> a plain seg6 encap route. Many stacks -> ECMP."""
+        if not peer_dst or not usid_stacks:
+            print("[dp] empty profile — nothing to program"); return
+        cmd = ["ip", "-6", "route", "replace", f"{peer_dst}/128"]
+        if len(usid_stacks) == 1:
+            cmd += ["encap", "seg6", "mode", "encap", "segs", usid_stacks[0],
+                    "dev", self.underlay]
+        else:
+            for u in usid_stacks:
+                cmd += ["nexthop", "encap", "seg6", "mode", "encap", "segs", u,
+                        "dev", self.underlay, "weight", "1"]
+        if self.dry: print("[dry] " + " ".join(cmd))
+        else:
+            r = run(cmd, capture=True)
+            if r.returncode != 0:
+                sys.stderr.write(f"[dp] route program FAILED: {r.stderr.strip()}\n"); return
+        self.installed_route_dst = peer_dst
+        self.installed_segs = list(usid_stacks)
+        kind = "ECMP" if len(usid_stacks) > 1 else "single"
+        print(f"[dp] route -> {peer_dst} via {kind} ({len(usid_stacks)} path) {usid_stacks}")
+
+    def show_routes(self):
+        if self.installed_route_dst:
+            return run(["ip", "-6", "route", "show", self.installed_route_dst], capture=True).stdout
+        return run(["ip", "-6", "route", "show", "dev", self.underlay], capture=True).stdout
+
+# ---- metrics sampling ------------------------------------------------------
+def _stats(iface):
+    try:
+        with open(f"/sys/class/net/{iface}/statistics/tx_bytes") as f: tx = int(f.read())
+        with open(f"/sys/class/net/{iface}/statistics/rx_bytes") as f: rx = int(f.read())
+        return tx, rx
+    except FileNotFoundError:
+        return None, None
+
+class MetricsPoster(threading.Thread):
+    """Polls underlay counters and POSTs to /api/metrics every period."""
+    def __init__(self, controller, host, iface, period=METRICS_PERIOD, dp=None):
+        super().__init__(daemon=True)
+        self.controller = controller.rstrip("/")
+        self.host = host
+        self.iface = iface
+        self.period = period
+        self.dp = dp
+        self.stop = threading.Event()
+        self.last_tx = self.last_rx = None
+        self.last_ts = None
+        self.last_bps = (0.0, 0.0)
+
+    def run(self):
+        while not self.stop.is_set():
+            tx, rx = _stats(self.iface); ts = time.time()
+            if tx is not None and self.last_tx is not None:
+                dt = ts - self.last_ts
+                if dt > 0:
+                    tx_bps = max(0.0, (tx - self.last_tx) * 8.0 / dt)
+                    rx_bps = max(0.0, (rx - self.last_rx) * 8.0 / dt)
+                    self.last_bps = (tx_bps, rx_bps)
+                    self._post(tx_bps, rx_bps)
+            self.last_tx, self.last_rx, self.last_ts = tx, rx, ts
+            self.stop.wait(self.period)
+
+    def _post(self, tx_bps, rx_bps):
+        body = json.dumps({
+            "host": self.host, "iface": self.iface,
+            "eth_tx_bps": tx_bps, "eth_rx_bps": rx_bps,
+            "routes": len(self.dp.installed_segs) if self.dp else 0,
+        }).encode()
+        req = urlreq.Request(f"{self.controller}/api/metrics", data=body,
+                             headers={"Content-Type": "application/json"})
+        try: urlreq.urlopen(req, timeout=2).read()
+        except (urlerr.URLError, socket.timeout): pass    # controller hiccup; keep polling
+
+# ---- SSE subscription ------------------------------------------------------
+def sse_subscribe(url, on_message, stop_evt):
+    """Block on an SSE stream, invoking on_message(dict) for each profile event.
+    Reconnects with exponential backoff on any failure."""
+    backoff = RECONNECT_BASE
+    while not stop_evt.is_set():
+        try:
+            print(f"[sse] connecting to {url}")
+            req = urlreq.Request(url, headers={"Accept": "text/event-stream"})
+            with urlreq.urlopen(req, timeout=10) as resp:
+                print(f"[sse] connected (HTTP {resp.status})")
+                backoff = RECONNECT_BASE
+                buf = b""
+                for line in resp:
+                    if stop_evt.is_set(): break
+                    if line in (b"\n", b"\r\n"):
+                        # event boundary: process any accumulated data: lines
+                        for L in buf.split(b"\n"):
+                            if L.startswith(b"data:"):
+                                try: on_message(json.loads(L[5:].strip()))
+                                except json.JSONDecodeError as e:
+                                    sys.stderr.write(f"[sse] bad json: {e}\n")
+                        buf = b""
+                    else:
+                        buf += line
+        except (urlerr.URLError, socket.timeout, ConnectionResetError) as e:
+            sys.stderr.write(f"[sse] disconnected: {e} — retrying in {backoff:.0f}s\n")
+        except Exception as e:
+            sys.stderr.write(f"[sse] error: {e!r} — retrying in {backoff:.0f}s\n")
+        for _ in range(int(backoff * 10)):
+            if stop_evt.is_set(): return
+            time.sleep(0.1)
+        backoff = min(backoff * 2, RECONNECT_CAP)
+
+# ---- driver ----------------------------------------------------------------
+def cmd_run(args):
+    dp = Dataplane(args.iface, args.tenant, args.underlay, dry_run=args.dry_run)
+    dp.bring_up()
+    stop = threading.Event()
+    def shutdown(*_): print("[agent] stop"); stop.set()
+    signal.signal(signal.SIGINT, shutdown); signal.signal(signal.SIGTERM, shutdown)
+
+    metrics = MetricsPoster(args.controller, args.host, args.underlay, dp=dp)
+    metrics.start()
+
+    state = {"profile": None}
+    def on_profile(p):
+        state["profile"] = p
+        dst = p.get("active_dst") or (p.get("flow") or {}).get("dst_addr")
+        stacks = [e["usid"] for e in (p.get("active_evs") or []) if e.get("usid")]
+        if not stacks and p.get("active_usid"): stacks = [p["active_usid"]]
+        print(f"[push] mode={p.get('mode')} paths={len(stacks)} dst={dst}")
+        if dst and stacks: dp.program(dst, stacks)
+
+    try:
+        sse_subscribe(f"{args.controller.rstrip('/')}/api/profile/stream", on_profile, stop)
+    finally:
+        metrics.stop.set()
+        if args.delete_iface_on_exit: dp.tear_down()
+
+def cmd_show(args):
+    url = f"{args.controller.rstrip('/')}/api/profile"
+    try:
+        p = json.loads(urlreq.urlopen(url, timeout=3).read())
+    except Exception as e:
+        print(f"controller unreachable: {e}"); sys.exit(1)
+    print(f"== mrc-agent / controller {args.controller} ==")
+    print(f"  mode:      {p['mode']} ({'multipath' if p.get('multipath') else 'single'})")
+    print(f"  flow:      {p['flow']['src']} -> {p['flow']['dst']} ({p['flow'].get('dst_addr')})")
+    print(f"  active EV set ({len(p['active_evs'])} path(s)):")
+    for e in p["active_evs"]:
+        print(f"    EV {e['entropy']:>5}  {e['usid']}")
+    r = run(["ip", "-6", "route", "show", p["flow"].get("dst_addr") or "::/0"], capture=True)
+    print("\n== current host route ==")
+    print((r.stdout or "(none)").rstrip())
+    try:
+        m = json.loads(urlreq.urlopen(f"{args.controller.rstrip('/')}/api/metrics", timeout=3).read())
+        print("\n== agent-reported host metrics ==")
+        for h, v in m.items():
+            print(f"  {h}: tx={v['eth_tx_bps']/1e9:.3f} Gbps  rx={v['eth_rx_bps']/1e9:.3f} Gbps  "
+                  f"iface={v['iface']}  routes={v['routes']}  age={time.time()-v['ts']:.1f}s")
+    except Exception as e:
+        print(f"\n(metrics not available: {e})")
+
+def cmd_test(args):
+    """One-shot SSE test: connect, print the first event, exit."""
+    url = f"{args.controller.rstrip('/')}/api/profile/stream"
+    print(f"[test] connecting to {url}")
+    stop = threading.Event()
+    def on(p):
+        print(f"[test] received profile: mode={p.get('mode')} active_evs={len(p.get('active_evs',[]))}")
+        stop.set()
+    t = threading.Thread(target=sse_subscribe, args=(url, on, stop), daemon=True)
+    t.start()
+    t.join(timeout=args.timeout)
+    if not stop.is_set(): print("[test] timeout"); sys.exit(2)
+    print("[test] OK")
+
+def main():
+    ap = argparse.ArgumentParser(prog="mrc-agent")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_run = sub.add_parser("run", help="run the agent (foreground)")
+    p_run.add_argument("--host", required=True, help="logical host name (matches fabric.json)")
+    p_run.add_argument("--controller", required=True, help="http://controller:9810")
+    p_run.add_argument("--tenant", required=True, help="this host's IPv6 tenant address (placed on mrc0)")
+    p_run.add_argument("--underlay", default="eth1", help="underlay interface for seg6 egress")
+    p_run.add_argument("--iface", default=DEFAULT_IFACE, help="virtual NIC name")
+    p_run.add_argument("--dry-run", action="store_true", help="print ip commands instead of running them")
+    p_run.add_argument("--delete-iface-on-exit", action="store_true")
+    p_run.set_defaults(func=cmd_run)
+
+    p_show = sub.add_parser("show", help="show current EV profile + installed route + metrics")
+    p_show.add_argument("--controller", required=True)
+    p_show.set_defaults(func=cmd_show)
+
+    p_test = sub.add_parser("test", help="one-shot SSE connection test")
+    p_test.add_argument("--controller", required=True)
+    p_test.add_argument("--timeout", type=float, default=5.0)
+    p_test.set_defaults(func=cmd_test)
+
+    args = ap.parse_args()
+    args.func(args)
+
+if __name__ == "__main__":
+    main()
