@@ -144,9 +144,10 @@ do_controller() {
 # ---- agents ----------------------------------------------------------------
 push_agent() {
   local H="$1"; local P; P=$(host_pfx "$H")
-  echo "==> $H: install + start mrc-agent"
+  echo "==> $H: install + start mrc-agent (+ mrc-probe)"
   docker cp "$PROJECT/agent/mrc-agent" "$H:/usr/local/bin/mrc-agent"
-  docker exec "$H" chmod +x /usr/local/bin/mrc-agent
+  docker cp "$PROJECT/tools/mrc-probe" "$H:/usr/local/bin/mrc-probe"
+  docker exec "$H" chmod +x /usr/local/bin/mrc-agent /usr/local/bin/mrc-probe
   docker exec "$H" pkill -9 -f 'mrc-agent run' 2>/dev/null || true; sleep 1
   docker exec -d "$H" bash -c "
     nohup /usr/local/bin/mrc-agent run \

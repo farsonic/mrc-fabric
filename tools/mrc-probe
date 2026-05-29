@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""
+mrc-probe — MRC-aware synthetic UDP packet generator.
+
+Pairs with mrc-agent. Reads the local agent state file to learn the active
+mode and EVs, then emits UDP packets to the peer with source ports chosen
+per-mode so the underlay's L4 hash spreads them across the controller's
+selected paths:
+
+  mode=none    one stream, ephemeral src port, no MRC encoding
+  mode=udp     one stream per EV, src port = EV value
+  mode=stev    one stream per EV, src port = STEV-encoded (path bits + flow id)
+  mode=srv6    one stream per EV (kernel does the encap); src port irrelevant
+
+Watches the state file: when the controller flips mode or active paths, the
+sender set is rebuilt automatically. Output is per-stream packet/byte counts
+plus an aggregate rate, refreshed every 2s — designed to pair with
+'mrc-agent monitor' in another terminal.
+
+Usage:
+  mrc-probe --peer <addr> [--port 5202] [--rate 5000] [--size 1024] [--watch]
+"""
+
+import argparse, json, os, signal, socket, sys, threading, time
+from pathlib import Path
+
+DEFAULT_STATE = "/run/mrc-agent.json"
+FALLBACK_STATE = "/tmp/mrc-agent.json"
+DEFAULT_PORT  = 5202
+
+# ---- state -----------------------------------------------------------------
+def read_state(path):
+    for p in [path, FALLBACK_STATE]:
+        try:
+            with open(p) as f: return json.load(f)
+        except FileNotFoundError: continue
+        except Exception as e:
+            print(f"[probe] error reading {p}: {e}", file=sys.stderr)
+            return None
+    return None
+
+def stev_encode(ev, flow_idx):
+    """Demo STEV encoding: keep srcport in ephemeral range, encode path-ID
+    from low bits of EV in upper byte, flow index in low byte. The real
+    STEV layout is per the OCP MRC spec — this is a faithful stand-in for
+    visualization (different EVs → different srcports → different L4 hash
+    buckets at the switch)."""
+    path_id = ev & 0xFF
+    flow_id = flow_idx & 0x1F
+    return 0xC000 | (path_id << 5) | flow_id   # always within 0xC000-0xFFFF
+
+# ---- sender stream ---------------------------------------------------------
+class Stream(threading.Thread):
+    def __init__(self, mode, ev, label, peer_addr, peer_port, flow_idx,
+                 rate_pps, payload_size, stop):
+        super().__init__(daemon=True)
+        self.mode, self.ev, self.label = mode, ev, label
+        self.peer_addr, self.peer_port = peer_addr, peer_port
+        self.flow_idx, self.rate_pps, self.payload_size = flow_idx, rate_pps, payload_size
+        self.stop = stop
+        self.pkts = 0; self.bytes = 0; self.errors = 0
+        self.src_port = self._pick_src_port()
+        self.sock = self._open_socket()
+
+    def _pick_src_port(self):
+        if self.mode == "udp":  return int(self.ev)
+        if self.mode == "stev": return stev_encode(int(self.ev), self.flow_idx)
+        return 0   # ephemeral — kernel picks (srv6 / none)
+
+    def _open_socket(self):
+        family = socket.AF_INET6 if ":" in self.peer_addr else socket.AF_INET
+        s = socket.socket(family, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        bind_addr = "::" if family == socket.AF_INET6 else "0.0.0.0"
+        try:
+            s.bind((bind_addr, self.src_port))
+        except OSError as e:
+            print(f"[probe] {self.label}: bind srcport={self.src_port} failed ({e}); using ephemeral", file=sys.stderr)
+            s.bind((bind_addr, 0))
+            self.src_port = s.getsockname()[1]
+        return s
+
+    def run(self):
+        payload = (b"MRCPROBE" + b"\x00" * max(self.payload_size - 8, 0))[:self.payload_size]
+        interval = 1.0 / max(self.rate_pps, 1)
+        next_t = time.monotonic()
+        while not self.stop.is_set():
+            try:
+                self.sock.sendto(payload, (self.peer_addr, self.peer_port))
+                self.pkts += 1; self.bytes += len(payload)
+            except OSError:
+                self.errors += 1
+            next_t += interval
+            delay = next_t - time.monotonic()
+            if delay > 0: self.stop.wait(delay)
+            else:         next_t = time.monotonic()
+        try: self.sock.close()
+        except Exception: pass
+
+# ---- driver ----------------------------------------------------------------
+class Driver:
+    def __init__(self, args):
+        self.args = args
+        self.lock = threading.Lock()
+        self.streams = []          # current Stream instances
+        self.local_stop = None     # stop event for current generation
+        self.last_mode = None
+        self.last_evs  = None
+        self._reset_at = time.time()
+        self._reset_baseline = 0   # total bytes baseline at last reset
+
+    def _rebuild(self, mode, evs_list):
+        """Spin down the current streams and start a fresh set for this mode."""
+        with self.lock:
+            if self.local_stop:
+                self.local_stop.set()
+                for s in self.streams: s.join(timeout=0.3)
+            self.streams = []
+            self.local_stop = threading.Event()
+            stop = self.local_stop
+
+            # Build the list of (ev, label) pairs for this mode.
+            pairs = []
+            if mode in ("udp", "stev", "srv6") and evs_list:
+                # one stream per EV, labeled by the path id if present in evs_list
+                for idx, e in enumerate(evs_list):
+                    ev    = e.get("entropy", 49000 + idx)
+                    label = e.get("path", f"ev-{ev}")
+                    pairs.append((ev, label, idx))
+            else:
+                # plain RoCEv2 / nothing active — one ephemeral stream
+                pairs.append((0, "plain", 0))
+
+            for ev, label, idx in pairs:
+                st = Stream(mode, ev, label, self.args.peer, self.args.port, idx,
+                            self.args.rate, self.args.size, stop)
+                st.start()
+                self.streams.append(st)
+
+            self.last_mode = mode; self.last_evs = tuple(e[0] for e in pairs)
+            self._reset_at = time.time(); self._reset_baseline = 0
+            print(f"[probe] mode={mode}  streams={len(self.streams)}  rate={self.args.rate}pps "
+                  f"size={self.args.size}B  → {self.args.peer}:{self.args.port}")
+            for s in self.streams:
+                print(f"          {s.label:<22}  EV={s.ev:<6}  src_port={s.src_port}")
+
+    def apply_state(self, state):
+        prof = (state or {}).get("profile") or {}
+        mode = (prof.get("mode") or "none").lower()
+        evs  = prof.get("active_evs") or []
+        # Enrich evs with path label from the full profile.evs list
+        full = {e.get("entropy"): e for e in (prof.get("evs") or [])}
+        evs_enriched = []
+        for e in evs:
+            entry = dict(e); ent = e.get("entropy")
+            if ent in full: entry["path"] = full[ent].get("id", entry.get("usid", "?"))
+            evs_enriched.append(entry)
+        key = (mode, tuple(e.get("entropy") for e in evs_enriched))
+        if key != (self.last_mode, self.last_evs):
+            self._rebuild(mode, evs_enriched)
+
+    def stop(self):
+        with self.lock:
+            if self.local_stop: self.local_stop.set()
+            for s in self.streams: s.join(timeout=0.3)
+            self.streams = []
+
+# ---- main ------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(prog="mrc-probe", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--peer", required=True, help="peer tenant address (IPv6 or IPv4)")
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT,
+                    help=f"destination UDP port (default {DEFAULT_PORT})")
+    ap.add_argument("--rate", type=int, default=5000,
+                    help="packets per second per stream (default 5000)")
+    ap.add_argument("--size", type=int, default=1024,
+                    help="UDP payload size in bytes (default 1024)")
+    ap.add_argument("--state", default=DEFAULT_STATE,
+                    help=f"agent state file (default {DEFAULT_STATE})")
+    ap.add_argument("--watch", action="store_true",
+                    help="re-read state every 1s; rebuild streams on mode/EV change")
+    ap.add_argument("--duration", type=int, default=0,
+                    help="stop after N seconds (0 = until ctrl-c)")
+    args = ap.parse_args()
+
+    drv = Driver(args)
+    state = read_state(args.state)
+    if not state:
+        print(f"[probe] no agent state at {args.state}; running in plain mode", file=sys.stderr)
+    drv.apply_state(state or {})
+
+    stop = threading.Event()
+    def _sig(*a): stop.set()
+    signal.signal(signal.SIGINT, _sig); signal.signal(signal.SIGTERM, _sig)
+
+    # background watcher
+    if args.watch:
+        def watch():
+            while not stop.is_set():
+                stop.wait(1.0)
+                if stop.is_set(): break
+                s = read_state(args.state)
+                if s: drv.apply_state(s)
+        threading.Thread(target=watch, daemon=True).start()
+
+    # periodic stats line — anchored to Driver's reset baseline so mode flips
+    # don't produce phantom negative rates.
+    def stats():
+        last_b = 0; last_t = time.time()
+        last_reset_at = drv._reset_at
+        while not stop.is_set():
+            stop.wait(2.0)
+            if stop.is_set(): break
+            now = time.time()
+            # if streams were rebuilt since our last sample, restart the baseline
+            if drv._reset_at != last_reset_at:
+                last_b = 0; last_t = drv._reset_at; last_reset_at = drv._reset_at
+            dt = max(now - last_t, 1e-3)
+            tot_p = sum(s.pkts  for s in drv.streams)
+            tot_b = sum(s.bytes for s in drv.streams)
+            tot_e = sum(s.errors for s in drv.streams)
+            db = max(tot_b - last_b, 0)
+            mbps = (db * 8.0) / dt / 1e6
+            per_stream = "  ".join(f"{s.label}({s.pkts}p)" for s in drv.streams)
+            print(f"[probe] {tot_p:>8}p  {tot_b:>12}B  {mbps:>6.2f} Mbps over {dt:.1f}s  err={tot_e}   {per_stream}")
+            last_b = tot_b; last_t = now
+    threading.Thread(target=stats, daemon=True).start()
+
+    deadline = time.time() + args.duration if args.duration > 0 else None
+    while not stop.is_set():
+        if deadline and time.time() >= deadline: break
+        time.sleep(0.5)
+    drv.stop()
+    print("[probe] stopped.")
+
+if __name__ == "__main__":
+    main()
