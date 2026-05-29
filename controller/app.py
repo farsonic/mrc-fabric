@@ -112,44 +112,61 @@ def apply_mode_default(mode):
 def link_key(a, b): return "|".join(sorted([a, b]))
 
 def telemetry():
-    """Per-link bps. Where an agent has reported real eth counters, use those for
-    the host-facing link; spine links remain the offered-rate spray model until
-    real switch interface-counter polling is wired."""
+    """Per-link bps. Prefers REAL host counters from agents over the
+    offered-rate model. When the source host has reported fresh metrics
+    (<5s old), the aggregate is its measured underlay tx rate, and the
+    per-path split is aggregate/n_paths (a faithful approximation — the
+    src-port hash spreads evenly in expectation). When no agent has
+    reported, we fall back to the offered-rate model so the viz still
+    "breathes" for demos before traffic actually flows."""
     paths = compute_paths()
     active = [p for p in paths if p["id"] in STATE["active_paths"] and p["status"] == "good"]
     n = len(active)
-    share = (STATE["offered_gbps"] * 1e9 / n) if n else 0.0   # bits/s per path
+
+    src = STATE["flow"].get("src")
+    src_m = HOST_METRICS.get(src)
+    src_fresh = bool(src_m and (time.time() - src_m.get("ts", 0) < 5))
+
+    if src_fresh:
+        aggregate_bps = float(src_m["eth_tx_bps"])
+        source = "agent"
+        model_line = (f"real agent counters · source host {src} tx · "
+                      f"per-path split = aggregate / n_paths")
+    else:
+        aggregate_bps = STATE["offered_gbps"] * 1e9 if n else 0.0
+        source = "model"
+        model_line = (f"offered-rate model ({STATE['offered_gbps']} Gbps) — "
+                      f"no fresh agent metrics from '{src}'")
+
+    share = (aggregate_bps / n) if n else 0.0
     links_bps = {link_key(a, b): 0.0 for a, b in FAB.get("links", [])}
     per_path_bps = {}
     for p in active:
-        bw = share * (1.0 + random.uniform(-0.04, 0.04))
+        # tiny jitter only in modeled mode so the visualization breathes
+        bw = share * (1.0 + random.uniform(-0.04, 0.04)) if source == "model" else share
         per_path_bps[p["id"]] = bw
         ch = p["segments_nodes"]
         for i in range(len(ch) - 1):
             links_bps[link_key(ch[i], ch[i + 1])] += bw
 
-    # Overlay REAL host-facing link counters where an agent reported them.
-    real_overlay = {}
+    # Override access-link values with truth where agents report.
     for host_name, m in HOST_METRICS.items():
         h = host_of(host_name)
         if not h or time.time() - m.get("ts", 0) > 5: continue
         access = link_key(host_name, h["leaf"])
-        real_bps = max(m.get("eth_tx_bps", 0.0), m.get("eth_rx_bps", 0.0))
-        links_bps[access] = real_bps
-        real_overlay[access] = real_bps
+        bps = m["eth_tx_bps"] if host_name == src else m["eth_rx_bps"]
+        links_bps[access] = bps
 
-    # Convert to Gbps for the UI.
     def g(x): return round(x / 1e9, 3)
     return {
         "links":        {k: g(v) for k, v in links_bps.items()},
         "per_path":     {k: g(v) for k, v in per_path_bps.items()},
-        "total_gbps":   round(sum(per_path_bps.values()) / 1e9, 3),
+        "total_gbps":   round(aggregate_bps / 1e9, 3),
         "offered_gbps": STATE["offered_gbps"],
         "n_active":     n,
-        "real_links":   sorted(real_overlay.keys()),
+        "source":       source,   # "agent" or "model"
         "hosts_reporting": sorted(HOST_METRICS.keys()),
-        "model": ("host-counter overlay (real on access links) + offered-rate model (spine links)"
-                  if real_overlay else "offered-rate spray model (no agent metrics yet)"),
+        "model":        model_line,
     }
 
 # ---- profile ----------------------------------------------------------------
