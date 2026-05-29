@@ -9,27 +9,30 @@ programs the host dataplane to match the served EV profile in real time:
   - the host's tenant IPv6 address lives on mrc0 (decoupled from any underlay)
   - seg6 encap routes to peer tenant addresses (single-path OR ECMP multipath)
   - L4 multipath hashing sysctl
-  - posts eth0/eth1 byte counters back to the controller for real telemetry
+  - posts underlay byte counters back to the controller for real telemetry
+  - writes its full state to a local state file so `mrc-agent status` (and any
+    other tool on the host) can see everything in one place, instantly
 
 Any application sending to a peer tenant address picks up the agent's current
 state — apps stay MRC-unaware; the agent is the MRC endpoint.
 
-Usage:
-  mrc-agent run --host host00 --controller http://172.20.18.213:9810 \\
-                --tenant 2001:db8:cccc:00::2 --underlay eth1
-  mrc-agent show         # current EV profile + installed routes + metrics
-  mrc-agent test         # one-shot connection test against the controller
+Commands:
+  mrc-agent run     --host H --controller URL --tenant ADDR --underlay IF
+  mrc-agent status  [--watch] [--json] [--state PATH]
+  mrc-agent paths   [--state PATH]
+  mrc-agent test    --controller URL
 """
-import argparse, json, os, signal, socket, subprocess, sys, threading, time
+import argparse, json, os, signal, socket, subprocess, sys, tempfile, threading, time
 from urllib import request as urlreq, error as urlerr
 
 DEFAULT_IFACE   = "mrc0"
-METRICS_PERIOD  = 1.0     # seconds between metric POSTs
-RECONNECT_BASE  = 1.0     # seconds; exponential backoff capped below
+DEFAULT_STATE   = "/run/mrc-agent.json"        # falls back to /tmp/mrc-agent.json if /run unwritable
+METRICS_PERIOD  = 1.0
+RECONNECT_BASE  = 1.0
 RECONNECT_CAP   = 30.0
+VERSION         = "0.2"
 
 def run(cmd, check=False, capture=False):
-    """Run a shell command; never raises on nonzero unless check=True."""
     r = subprocess.run(cmd, shell=isinstance(cmd, str),
                        stdout=subprocess.PIPE if capture else None,
                        stderr=subprocess.PIPE if capture else None,
@@ -38,28 +41,90 @@ def run(cmd, check=False, capture=False):
         raise RuntimeError(f"cmd failed ({r.returncode}): {cmd}\n{r.stderr}")
     return r
 
-# ---- dataplane ops ---------------------------------------------------------
+# ---- shared agent state (single writer: the run-loop) ---------------------
+class State:
+    """Thread-safe-ish state object, written to disk atomically on every change.
+    Single writer pattern: the SSE thread updates `profile`/`kernel`/`controller`,
+    the metrics thread updates `counters`. We use a lock around the dict mutation
+    and the write."""
+    def __init__(self, path, agent_meta):
+        self.path = path
+        self.lock = threading.Lock()
+        self.data = {
+            "version": 1, "agent_version": VERSION,
+            "agent": agent_meta,
+            "controller": {
+                "url": agent_meta.get("controller_url", ""),
+                "status": "starting",
+                "last_event_at": 0, "events_received": 0, "reconnects": 0,
+            },
+            "profile": None,           # last received profile (full snapshot)
+            "kernel": {
+                "route_dst": None, "n_paths": 0,
+                "last_program_at": 0, "last_program_ok": None,
+                "last_program_error": None,
+            },
+            "counters": {
+                "iface": agent_meta.get("underlay"),
+                "tx_bytes_total": 0, "rx_bytes_total": 0,
+                "tx_bps_1s": 0.0, "rx_bps_1s": 0.0,
+                "sampled_at": 0,
+            },
+        }
+
+    def update(self, section, **kw):
+        with self.lock:
+            self.data.setdefault(section, {}).update(kw)
+            self.data["agent"]["uptime_s"] = int(time.time() - self.data["agent"]["started_at"])
+            self._flush()
+
+    def set(self, section, value):
+        with self.lock:
+            self.data[section] = value
+            self.data["agent"]["uptime_s"] = int(time.time() - self.data["agent"]["started_at"])
+            self._flush()
+
+    def _flush(self):
+        # atomic write: write to tmp + rename
+        try:
+            d = os.path.dirname(self.path) or "."
+            os.makedirs(d, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=".mrc-agent.", dir=d)
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.data, f, indent=2)
+            os.replace(tmp, self.path)
+        except Exception as e:
+            sys.stderr.write(f"[state] write failed: {e}\n")
+
+def resolve_state_path(requested):
+    """If the default /run path isn't writable, fall back to /tmp."""
+    if requested != DEFAULT_STATE:
+        return requested
+    try:
+        os.makedirs("/run", exist_ok=True)
+        with open("/run/.mrc-agent-probe", "w") as f: f.write("ok")
+        os.unlink("/run/.mrc-agent-probe")
+        return "/run/mrc-agent.json"
+    except (PermissionError, OSError):
+        return "/tmp/mrc-agent.json"
+
+# ---- dataplane ------------------------------------------------------------
 class Dataplane:
-    """Owns mrc0 + the encap routes to peer tenant addresses."""
     def __init__(self, iface, tenant_addr, underlay, dry_run=False):
-        self.iface = iface
-        self.tenant = tenant_addr
-        self.underlay = underlay
+        self.iface = iface; self.tenant = tenant_addr; self.underlay = underlay
         self.dry = dry_run
-        self.installed_route_dst = None     # last /128 we programmed
-        self.installed_segs = []            # list of uSID stacks currently routed
+        self.installed_route_dst = None
+        self.installed_segs = []
 
     def _ip(self, args):
         cmd = ["ip"] + args
-        if self.dry:
-            print("[dry] " + " ".join(cmd)); return 0
+        if self.dry: print("[dry] " + " ".join(cmd)); return 0, ""
         r = run(cmd, capture=True)
         if r.returncode != 0:
             sys.stderr.write(f"[ip] {' '.join(args)} -> {r.returncode}: {r.stderr.strip()}\n")
-        return r.returncode
+        return r.returncode, r.stderr or ""
 
     def bring_up(self):
-        """Create mrc0 if missing, set up, place the tenant address on it."""
         if self.dry:
             for c in [["link", "add", self.iface, "type", "dummy"],
                       ["link", "set", self.iface, "up"],
@@ -67,13 +132,10 @@ class Dataplane:
                 self._ip(c)
             print(f"[dp:dry] {self.iface} up, tenant {self.tenant}/128, underlay={self.underlay}")
             return
-        # idempotent create
         if run(["ip", "link", "show", self.iface], capture=True).returncode != 0:
             self._ip(["link", "add", self.iface, "type", "dummy"])
         self._ip(["link", "set", self.iface, "up"])
-        # Move the tenant address onto mrc0 (idempotent: replace).
         self._ip(["-6", "addr", "replace", f"{self.tenant}/128", "dev", self.iface])
-        # ECMP across seg6 nexthops needs L4 hashing.
         run("sysctl -w net.ipv6.fib_multipath_hash_policy=1 >/dev/null 2>&1", capture=True)
         print(f"[dp] {self.iface} up, tenant {self.tenant}/128, underlay={self.underlay}")
 
@@ -82,10 +144,7 @@ class Dataplane:
         self._ip(["link", "del", self.iface])
 
     def program(self, peer_dst, usid_stacks):
-        """Replace the encap route to peer_dst with the given uSID stack(s).
-        One stack -> a plain seg6 encap route. Many stacks -> ECMP."""
-        if not peer_dst or not usid_stacks:
-            print("[dp] empty profile — nothing to program"); return
+        if not peer_dst or not usid_stacks: return False, "empty profile"
         cmd = ["ip", "-6", "route", "replace", f"{peer_dst}/128"]
         if len(usid_stacks) == 1:
             cmd += ["encap", "seg6", "mode", "encap", "segs", usid_stacks[0],
@@ -94,22 +153,20 @@ class Dataplane:
             for u in usid_stacks:
                 cmd += ["nexthop", "encap", "seg6", "mode", "encap", "segs", u,
                         "dev", self.underlay, "weight", "1"]
-        if self.dry: print("[dry] " + " ".join(cmd))
+        if self.dry:
+            print("[dry] " + " ".join(cmd))
         else:
             r = run(cmd, capture=True)
             if r.returncode != 0:
-                sys.stderr.write(f"[dp] route program FAILED: {r.stderr.strip()}\n"); return
+                sys.stderr.write(f"[dp] route program FAILED: {r.stderr.strip()}\n")
+                return False, r.stderr.strip()
         self.installed_route_dst = peer_dst
         self.installed_segs = list(usid_stacks)
         kind = "ECMP" if len(usid_stacks) > 1 else "single"
-        print(f"[dp] route -> {peer_dst} via {kind} ({len(usid_stacks)} path) {usid_stacks}")
+        print(f"[dp] route -> {peer_dst} via {kind} ({len(usid_stacks)} path)")
+        return True, None
 
-    def show_routes(self):
-        if self.installed_route_dst:
-            return run(["ip", "-6", "route", "show", self.installed_route_dst], capture=True).stdout
-        return run(["ip", "-6", "route", "show", "dev", self.underlay], capture=True).stdout
-
-# ---- metrics sampling ------------------------------------------------------
+# ---- counters -------------------------------------------------------------
 def _stats(iface):
     try:
         with open(f"/sys/class/net/{iface}/statistics/tx_bytes") as f: tx = int(f.read())
@@ -119,29 +176,28 @@ def _stats(iface):
         return None, None
 
 class MetricsPoster(threading.Thread):
-    """Polls underlay counters and POSTs to /api/metrics every period."""
-    def __init__(self, controller, host, iface, period=METRICS_PERIOD, dp=None):
+    def __init__(self, controller, host, iface, state, dp, period=METRICS_PERIOD):
         super().__init__(daemon=True)
-        self.controller = controller.rstrip("/")
-        self.host = host
-        self.iface = iface
-        self.period = period
-        self.dp = dp
+        self.controller = controller.rstrip("/"); self.host = host; self.iface = iface
+        self.state = state; self.dp = dp; self.period = period
         self.stop = threading.Event()
-        self.last_tx = self.last_rx = None
-        self.last_ts = None
-        self.last_bps = (0.0, 0.0)
+        self.last_tx = self.last_rx = self.last_ts = None
 
     def run(self):
         while not self.stop.is_set():
             tx, rx = _stats(self.iface); ts = time.time()
+            tx_bps = rx_bps = 0.0
             if tx is not None and self.last_tx is not None:
                 dt = ts - self.last_ts
                 if dt > 0:
                     tx_bps = max(0.0, (tx - self.last_tx) * 8.0 / dt)
                     rx_bps = max(0.0, (rx - self.last_rx) * 8.0 / dt)
-                    self.last_bps = (tx_bps, rx_bps)
-                    self._post(tx_bps, rx_bps)
+            if tx is not None:
+                self.state.update("counters", iface=self.iface,
+                                  tx_bytes_total=tx, rx_bytes_total=rx,
+                                  tx_bps_1s=tx_bps, rx_bps_1s=rx_bps,
+                                  sampled_at=ts)
+                self._post(tx_bps, rx_bps)
             self.last_tx, self.last_rx, self.last_ts = tx, rx, ts
             self.stop.wait(self.period)
 
@@ -149,30 +205,31 @@ class MetricsPoster(threading.Thread):
         body = json.dumps({
             "host": self.host, "iface": self.iface,
             "eth_tx_bps": tx_bps, "eth_rx_bps": rx_bps,
-            "routes": len(self.dp.installed_segs) if self.dp else 0,
+            "routes": len(self.dp.installed_segs),
         }).encode()
         req = urlreq.Request(f"{self.controller}/api/metrics", data=body,
                              headers={"Content-Type": "application/json"})
         try: urlreq.urlopen(req, timeout=2).read()
-        except (urlerr.URLError, socket.timeout): pass    # controller hiccup; keep polling
+        except (urlerr.URLError, socket.timeout): pass
 
-# ---- SSE subscription ------------------------------------------------------
-def sse_subscribe(url, on_message, stop_evt):
-    """Block on an SSE stream, invoking on_message(dict) for each profile event.
-    Reconnects with exponential backoff on any failure."""
+# ---- SSE ------------------------------------------------------------------
+def sse_subscribe(url, on_message, on_status, stop_evt):
     backoff = RECONNECT_BASE
+    reconnects = -1
     while not stop_evt.is_set():
+        reconnects += 1
         try:
+            on_status("connecting", reconnects=reconnects)
             print(f"[sse] connecting to {url}")
             req = urlreq.Request(url, headers={"Accept": "text/event-stream"})
             with urlreq.urlopen(req, timeout=10) as resp:
                 print(f"[sse] connected (HTTP {resp.status})")
+                on_status("connected", reconnects=reconnects)
                 backoff = RECONNECT_BASE
                 buf = b""
                 for line in resp:
                     if stop_evt.is_set(): break
                     if line in (b"\n", b"\r\n"):
-                        # event boundary: process any accumulated data: lines
                         for L in buf.split(b"\n"):
                             if L.startswith(b"data:"):
                                 try: on_message(json.loads(L[5:].strip()))
@@ -182,75 +239,204 @@ def sse_subscribe(url, on_message, stop_evt):
                     else:
                         buf += line
         except (urlerr.URLError, socket.timeout, ConnectionResetError) as e:
+            on_status("disconnected", error=str(e))
             sys.stderr.write(f"[sse] disconnected: {e} — retrying in {backoff:.0f}s\n")
         except Exception as e:
+            on_status("error", error=repr(e))
             sys.stderr.write(f"[sse] error: {e!r} — retrying in {backoff:.0f}s\n")
         for _ in range(int(backoff * 10)):
             if stop_evt.is_set(): return
             time.sleep(0.1)
         backoff = min(backoff * 2, RECONNECT_CAP)
 
-# ---- driver ----------------------------------------------------------------
+# ---- driver ---------------------------------------------------------------
 def cmd_run(args):
+    state_path = resolve_state_path(args.state)
     dp = Dataplane(args.iface, args.tenant, args.underlay, dry_run=args.dry_run)
     dp.bring_up()
+    started = time.time()
+    state = State(state_path, agent_meta={
+        "host": args.host, "iface": args.iface, "tenant": args.tenant,
+        "underlay": args.underlay, "controller_url": args.controller,
+        "pid": os.getpid(), "started_at": started, "uptime_s": 0,
+        "dry_run": bool(args.dry_run),
+    })
+    print(f"[agent] state -> {state_path}")
+
     stop = threading.Event()
     def shutdown(*_): print("[agent] stop"); stop.set()
     signal.signal(signal.SIGINT, shutdown); signal.signal(signal.SIGTERM, shutdown)
 
-    metrics = MetricsPoster(args.controller, args.host, args.underlay, dp=dp)
+    metrics = MetricsPoster(args.controller, args.host, args.underlay, state, dp)
     metrics.start()
 
-    state = {"profile": None}
+    def on_status(status, **kw):
+        upd = {"status": status, "last_status_at": time.time()}
+        if "reconnects" in kw: upd["reconnects"] = kw["reconnects"]
+        if "error" in kw:      upd["last_error"] = kw["error"]
+        state.update("controller", **upd)
+
     def on_profile(p):
-        state["profile"] = p
         dst = p.get("active_dst") or (p.get("flow") or {}).get("dst_addr")
         stacks = [e["usid"] for e in (p.get("active_evs") or []) if e.get("usid")]
         if not stacks and p.get("active_usid"): stacks = [p["active_usid"]]
         print(f"[push] mode={p.get('mode')} paths={len(stacks)} dst={dst}")
-        if dst and stacks: dp.program(dst, stacks)
+
+        c = state.data["controller"]
+        state.update("controller",
+                     events_received=c.get("events_received", 0) + 1,
+                     last_event_at=time.time())
+        state.set("profile", {**p, "received_at": time.time()})
+        if dst and stacks:
+            ok, err = dp.program(dst, stacks)
+            state.update("kernel",
+                         route_dst=dst, n_paths=len(stacks),
+                         last_program_at=time.time(),
+                         last_program_ok=ok, last_program_error=err)
 
     try:
-        sse_subscribe(f"{args.controller.rstrip('/')}/api/profile/stream", on_profile, stop)
+        sse_subscribe(f"{args.controller.rstrip('/')}/api/profile/stream",
+                      on_profile, on_status, stop)
     finally:
         metrics.stop.set()
         if args.delete_iface_on_exit: dp.tear_down()
 
-def cmd_show(args):
-    url = f"{args.controller.rstrip('/')}/api/profile"
+# ---- status / paths / test ------------------------------------------------
+def _bps(n):
+    for u, t in [("Tbps", 1e12), ("Gbps", 1e9), ("Mbps", 1e6), ("Kbps", 1e3)]:
+        if n >= t: return f"{n/t:.2f} {u}"
+    return f"{n:.0f} bps"
+
+def _bytes(n):
+    for u, t in [("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("KB", 1e3)]:
+        if n >= t: return f"{n/t:.2f} {u}"
+    return f"{n} B"
+
+def _age(ts):
+    if not ts: return "—"
+    s = time.time() - ts
+    if s < 1.0: return "now"
+    if s < 60:  return f"{s:.1f}s ago"
+    if s < 3600: return f"{int(s/60)}m {int(s%60)}s ago"
+    return f"{int(s/3600)}h {int((s%3600)/60)}m ago"
+
+def _ctrl_badge(status):
+    return {
+        "connected":    ("✓", "CONNECTED"),
+        "connecting":   ("·", "connecting"),
+        "disconnected": ("✗", "DISCONNECTED"),
+        "error":        ("!", "ERROR"),
+        "starting":     ("·", "starting"),
+    }.get(status, ("?", status.upper() if status else "UNKNOWN"))
+
+def _read_state(path):
     try:
-        p = json.loads(urlreq.urlopen(url, timeout=3).read())
-    except Exception as e:
-        print(f"controller unreachable: {e}"); sys.exit(1)
-    print(f"== mrc-agent / controller {args.controller} ==")
-    print(f"  mode:      {p['mode']} ({'multipath' if p.get('multipath') else 'single'})")
-    print(f"  flow:      {p['flow']['src']} -> {p['flow']['dst']} ({p['flow'].get('dst_addr')})")
-    print(f"  active EV set ({len(p['active_evs'])} path(s)):")
-    for e in p["active_evs"]:
-        print(f"    EV {e['entropy']:>5}  {e['usid']}")
-    r = run(["ip", "-6", "route", "show", p["flow"].get("dst_addr") or "::/0"], capture=True)
-    print("\n== current host route ==")
-    print((r.stdout or "(none)").rstrip())
+        with open(path) as f: return json.load(f)
+    except FileNotFoundError:
+        sys.stderr.write(f"no state file at {path}; is mrc-agent running?\n")
+        sys.exit(2)
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"state file corrupted: {e}\n"); sys.exit(2)
+
+def _query_kernel_route(dst):
+    if not dst: return ""
     try:
-        m = json.loads(urlreq.urlopen(f"{args.controller.rstrip('/')}/api/metrics", timeout=3).read())
-        print("\n== agent-reported host metrics ==")
-        for h, v in m.items():
-            print(f"  {h}: tx={v['eth_tx_bps']/1e9:.3f} Gbps  rx={v['eth_rx_bps']/1e9:.3f} Gbps  "
-                  f"iface={v['iface']}  routes={v['routes']}  age={time.time()-v['ts']:.1f}s")
-    except Exception as e:
-        print(f"\n(metrics not available: {e})")
+        r = run(["ip", "-6", "route", "show", dst], capture=True)
+        return (r.stdout or "").rstrip() if r.returncode == 0 else ""
+    except FileNotFoundError:
+        return ""
+
+def render_status(s):
+    a = s["agent"]; c = s["controller"]; p = s.get("profile") or {}; k = s["kernel"]; m = s["counters"]
+    badge, label = _ctrl_badge(c.get("status", "?"))
+    lines = []
+    lines.append(f"╭─ {a['iface']} · MRC virtual NIC ──────────────────────── state UP ─╮")
+    lines.append(f"│  host        {a['host']}")
+    lines.append(f"│  identity    {a['tenant']}")
+    lines.append(f"│  underlay    {a['underlay']}")
+    upt = a.get("uptime_s", 0)
+    upt_str = f"{upt//3600}h {(upt%3600)//60}m {upt%60}s" if upt >= 3600 else f"{upt//60}m {upt%60}s" if upt >= 60 else f"{upt}s"
+    lines.append(f"│  uptime      {upt_str}")
+    if a.get("dry_run"): lines.append("│  *** DRY-RUN MODE — no kernel changes ***")
+    lines.append("╰" + "─" * 65)
+    lines.append("")
+    lines.append(f"  CONTROLLER  {c.get('url','-')}")
+    lines.append(f"    [{badge}] {label} · {c.get('events_received',0)} events received · last push {_age(c.get('last_event_at'))}")
+    if c.get("reconnects", 0): lines.append(f"        reconnects: {c['reconnects']}")
+    if c.get("last_error"):    lines.append(f"        last error: {c['last_error']}")
+    lines.append("")
+    if p:
+        mode = (p.get("mode") or "-").upper()
+        mp = " · multipath" if p.get("multipath") else ""
+        flow = p.get("flow") or {}
+        lines.append(f"  EV PROFILE  (mode {mode}{mp})")
+        lines.append(f"    flow      {flow.get('src','?')} → {flow.get('dst','?')} ({flow.get('dst_addr','-')})")
+        evs = p.get("active_evs") or []
+        # Build a {usid -> {id, spine}} lookup from the full evs list (the
+        # active_evs payload itself only carries entropy+usid).
+        by_usid = {e.get("usid"): e for e in (p.get("evs") or []) if e.get("usid")}
+        if evs:
+            for e in evs:
+                full = by_usid.get(e["usid"], {})
+                pid  = full.get("id", "via-?")
+                lines.append(f"    [✓] {pid:<18} EV {e['entropy']:>5}    {e['usid']}")
+        else:
+            lines.append("    (no active EVs in profile)")
+    else:
+        lines.append("  EV PROFILE  (none received yet)")
+    lines.append("")
+    lines.append(f"  KERNEL ROUTE  →  {k.get('route_dst','—')}")
+    if k.get("route_dst"):
+        kind = "ECMP" if k.get("n_paths", 0) > 1 else ("single-path" if k.get("n_paths") == 1 else "—")
+        status = "OK" if k.get("last_program_ok") else ("FAILED" if k.get("last_program_ok") is False else "—")
+        lines.append(f"    {kind} · {k.get('n_paths',0)} nexthop(s) · programmed {_age(k.get('last_program_at'))} · {status}")
+        if k.get("last_program_error"): lines.append(f"    error: {k['last_program_error']}")
+        live = _query_kernel_route(k["route_dst"])
+        if live:
+            lines.append("    live kernel route:")
+            for L in live.splitlines(): lines.append("      " + L)
+    lines.append("")
+    lines.append(f"  COUNTERS  (underlay {m.get('iface','-')}; mrc0 is metadata-only)")
+    lines.append(f"    tx        {_bytes(m.get('tx_bytes_total',0)):>12}    last sec   {_bps(m.get('tx_bps_1s',0))}")
+    lines.append(f"    rx        {_bytes(m.get('rx_bytes_total',0)):>12}    last sec   {_bps(m.get('rx_bps_1s',0))}")
+    lines.append(f"    sampled   {_age(m.get('sampled_at'))}")
+    return "\n".join(lines)
+
+def cmd_status(args):
+    path = resolve_state_path(args.state)
+    if args.watch:
+        try:
+            while True:
+                sys.stdout.write("\033[2J\033[H")
+                sys.stdout.write(render_status(_read_state(path)))
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                time.sleep(args.interval)
+        except KeyboardInterrupt: print()
+        return
+    s = _read_state(path)
+    if args.json: print(json.dumps(s, indent=2))
+    else:         print(render_status(s))
+
+def cmd_paths(args):
+    s = _read_state(resolve_state_path(args.state))
+    p = s.get("profile") or {}
+    by_usid = {e.get("usid"): e for e in (p.get("evs") or []) if e.get("usid")}
+    print(f"mode={p.get('mode','-').upper()} active={len(p.get('active_evs',[]))}")
+    for e in p.get("active_evs", []):
+        full = by_usid.get(e["usid"], {})
+        print(f"  [{full.get('id','via-?')}]  EV {e.get('entropy','?'):>5}   {e.get('usid','?')}")
 
 def cmd_test(args):
-    """One-shot SSE test: connect, print the first event, exit."""
     url = f"{args.controller.rstrip('/')}/api/profile/stream"
     print(f"[test] connecting to {url}")
     stop = threading.Event()
     def on(p):
         print(f"[test] received profile: mode={p.get('mode')} active_evs={len(p.get('active_evs',[]))}")
         stop.set()
-    t = threading.Thread(target=sse_subscribe, args=(url, on, stop), daemon=True)
-    t.start()
-    t.join(timeout=args.timeout)
+    def st(*a, **kw): pass
+    t = threading.Thread(target=sse_subscribe, args=(url, on, st, stop), daemon=True)
+    t.start(); t.join(timeout=args.timeout)
     if not stop.is_set(): print("[test] timeout"); sys.exit(2)
     print("[test] OK")
 
@@ -259,23 +445,32 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p_run = sub.add_parser("run", help="run the agent (foreground)")
-    p_run.add_argument("--host", required=True, help="logical host name (matches fabric.json)")
-    p_run.add_argument("--controller", required=True, help="http://controller:9810")
-    p_run.add_argument("--tenant", required=True, help="this host's IPv6 tenant address (placed on mrc0)")
-    p_run.add_argument("--underlay", default="eth1", help="underlay interface for seg6 egress")
-    p_run.add_argument("--iface", default=DEFAULT_IFACE, help="virtual NIC name")
-    p_run.add_argument("--dry-run", action="store_true", help="print ip commands instead of running them")
+    p_run.add_argument("--host", required=True)
+    p_run.add_argument("--controller", required=True)
+    p_run.add_argument("--tenant", required=True)
+    p_run.add_argument("--underlay", default="eth1")
+    p_run.add_argument("--iface", default=DEFAULT_IFACE)
+    p_run.add_argument("--state", default=DEFAULT_STATE,
+                       help=f"state file path (default {DEFAULT_STATE}, falls back to /tmp)")
+    p_run.add_argument("--dry-run", action="store_true")
     p_run.add_argument("--delete-iface-on-exit", action="store_true")
     p_run.set_defaults(func=cmd_run)
 
-    p_show = sub.add_parser("show", help="show current EV profile + installed route + metrics")
-    p_show.add_argument("--controller", required=True)
-    p_show.set_defaults(func=cmd_show)
+    p_st = sub.add_parser("status", help="rich view of the running agent (reads local state file)")
+    p_st.add_argument("--state", default=DEFAULT_STATE)
+    p_st.add_argument("--watch", action="store_true", help="refresh every --interval seconds")
+    p_st.add_argument("--interval", type=float, default=1.0)
+    p_st.add_argument("--json", action="store_true")
+    p_st.set_defaults(func=cmd_status)
 
-    p_test = sub.add_parser("test", help="one-shot SSE connection test")
-    p_test.add_argument("--controller", required=True)
-    p_test.add_argument("--timeout", type=float, default=5.0)
-    p_test.set_defaults(func=cmd_test)
+    p_pa = sub.add_parser("paths", help="just the active paths")
+    p_pa.add_argument("--state", default=DEFAULT_STATE)
+    p_pa.set_defaults(func=cmd_paths)
+
+    p_te = sub.add_parser("test", help="one-shot SSE connection test")
+    p_te.add_argument("--controller", required=True)
+    p_te.add_argument("--timeout", type=float, default=5.0)
+    p_te.set_defaults(func=cmd_test)
 
     args = ap.parse_args()
     args.func(args)

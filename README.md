@@ -73,10 +73,13 @@ git clone … mrc-fabric && cd mrc-fabric/lab
 ## What "running" looks like
 Once `./deploy.sh up` is done, on host00:
 ```
-mrc-agent show --controller http://172.20.18.213:9810
+mrc-agent status              # the rich at-a-glance view (reads local state file)
+mrc-agent status --watch      # live refresh
+mrc-agent paths               # just the active paths
 ```
-shows the current EV mode, the active EV set, the seg6 route the agent has
-installed for `host01`, and the host counters the controller is receiving.
+Shows host identity, controller connection state, the active EV set with
+friendly path IDs, the kernel route the agent has installed, and live underlay
+counters — all in one place.
 
 Toggle a path in the GUI (or `curl /api/profile`) — the agent log on the host
 records the push, and `ip -6 route show 2001:db8:cccc:01::2` changes within a

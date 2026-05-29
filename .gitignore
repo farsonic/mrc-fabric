@@ -12,3 +12,4 @@ venv/
 clab-*/
 *.log
 /lab/generated/
+/controller/fabric.json
