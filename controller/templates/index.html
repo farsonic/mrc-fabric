@@ -28,7 +28,12 @@
   .card .body{padding:14px} svg{width:100%;height:auto;display:block}
   .node rect{fill:#0e141b;stroke:var(--line);stroke-width:1.4}
   .node text{fill:var(--ink);font-size:10px} .node .u{fill:var(--cyan);font-size:9px}
-  .node.src rect{stroke:var(--amber)} .lnk{stroke:#26303c;stroke-width:2;fill:none}
+  .node.src rect{stroke:var(--amber)}
+  .node.dst rect{stroke:var(--cyan)}
+  .node circle.health{stroke:#0a0e13;stroke-width:1}
+  .node circle.health.alive{fill:#37d18a}
+  .node circle.health.dead{fill:#ff5a5a}
+  .lnk{stroke:#26303c;stroke-width:2;fill:none}
   .lnk.active{stroke:var(--amber);filter:drop-shadow(0 0 5px rgba(255,176,0,.5))}
   .lnk.deny{stroke:var(--red);stroke-dasharray:4 5;opacity:.45}
   .pkt{fill:var(--amber);filter:drop-shadow(0 0 5px var(--amber))}
@@ -98,17 +103,21 @@
   </div></div>
 </div>
 <script>
-let TOPO=null,PATHS=null,PROFILE=null,TELEM=null,POS={};
+let TOPO=null,PATHS=null,PROFILE=null,TELEM=null,HEALTH={},POS={};
 const lk=(a,b)=>[a,b].sort().join("|");
 async function load(){TOPO=await (await fetch("/api/topology")).json();await refresh();drawModes();
   document.getElementById("t-offer").onchange=e=>post("/api/profile",{offered_gbps:parseFloat(e.target.value)});}
 async function refresh(){
   const pj=await (await fetch("/api/paths")).json();PATHS=pj.paths;window.MODES=pj.modes;
   PROFILE=await (await fetch("/api/profile")).json();
-  TELEM=await (await fetch("/api/telemetry")).json();render();}
+  TELEM=await (await fetch("/api/telemetry")).json();
+  HEALTH=await (await fetch("/api/health")).json();render();}
 async function post(p,b){PROFILE=await (await fetch(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)})).json();
   const pj=await (await fetch("/api/paths")).json();PATHS=pj.paths;TELEM=await (await fetch("/api/telemetry")).json();render();}
-async function tick(){if(!TOPO)return;try{TELEM=await (await fetch("/api/telemetry")).json();drawTopo();drawTelem();}catch(e){}}
+async function tick(){if(!TOPO)return;try{
+  TELEM=await (await fetch("/api/telemetry")).json();
+  HEALTH=await (await fetch("/api/health")).json();
+  drawTopo();drawTelem();}catch(e){}}
 function layout(){POS={};const W=880;
   const row=(arr,y)=>{const n=arr.length;arr.forEach((x,i)=>{POS[x.name]={x:(W*(i+1)/(n+1))-34,y,w:68,h:34,label:x.name,usid:x.usid};});};
   row(TOPO.spines,40);row(TOPO.leaves,210);
@@ -131,7 +140,7 @@ function drawTopo(){
     const bps=TELEM?TELEM.links[lk(a,b)]||0:0;
     const ln=document.createElementNS(ns,"line");ln.setAttribute("x1",ca.x);ln.setAttribute("y1",ca.y);
     ln.setAttribute("x2",cb.x);ln.setAttribute("y2",cb.y);let cls="lnk";
-    if(denyset.has(a+">"+b))cls+=" deny";else if(aset.has(a+">"+b))cls+=" active";
+    if(aset.has(a+">"+b))cls+=" active";else if(denyset.has(a+">"+b))cls+=" deny";
     ln.setAttribute("class",cls);
     // line-width scales by aggregate (not fixed offered) so tiny real flows
     // are still visually proportional. Floor at 1G so dim links stay readable.
@@ -144,14 +153,48 @@ function drawTopo(){
     const pkt=document.createElementNS(ns,"circle");pkt.setAttribute("r","3.5");pkt.setAttribute("class","pkt");svg.appendChild(pkt);
     const am=document.createElementNS(ns,"animateMotion");am.setAttribute("dur","1.8s");am.setAttribute("repeatCount","indefinite");
     am.setAttribute("path","M "+pts.map(p=>p.x+" "+p.y).join(" L "));pkt.appendChild(am);});
+  const dst=PROFILE.flow.dst;
   Object.entries(POS).forEach(([name,p])=>{const g=document.createElementNS(ns,"g");
-    g.setAttribute("class","node"+(name===src?" src":""));
+    let cls="node"+(name===src?" src":"")+(name===dst?" dst":"");
+    g.setAttribute("class",cls);
     const r=document.createElementNS(ns,"rect");r.setAttribute("x",p.x);r.setAttribute("y",p.y);
     r.setAttribute("width",p.w);r.setAttribute("height",p.h);r.setAttribute("rx",3);g.appendChild(r);
     const t=document.createElementNS(ns,"text");t.setAttribute("x",p.x+p.w/2);t.setAttribute("y",p.y+(p.usid?15:21));
     t.setAttribute("text-anchor","middle");t.textContent=p.label;g.appendChild(t);
     if(p.usid){const u=document.createElementNS(ns,"text");u.setAttribute("x",p.x+p.w/2);u.setAttribute("y",p.y+27);
       u.setAttribute("text-anchor","middle");u.setAttribute("class","u");u.textContent=":"+p.usid;g.appendChild(u);}
+    // health dot top-right of the node box. Green = alive (host: agent fresh;
+    // switch: TCP probe ok); red = dead/unreachable; grey = unknown.
+    const h=HEALTH[name];
+    if(h){
+      const c=document.createElementNS(ns,"circle");c.setAttribute("cx",p.x+p.w-5);c.setAttribute("cy",p.y+5);
+      c.setAttribute("r","3.2");c.setAttribute("class","health "+(h.alive?"alive":"dead"));
+      g.appendChild(c);
+    }
+    // SVG title tooltip — native hover. Different content for hosts vs switches.
+    const tt=document.createElementNS(ns,"title");
+    if(h&&h.kind==="host"){
+      const tx=fmtRate((h.eth_tx_bps||0)/1e9),rx=fmtRate((h.eth_rx_bps||0)/1e9);
+      tt.textContent=[
+        name+(name===src?"  (source)":(name===dst?"  (destination)":"")),
+        "agent: "+(h.alive?"connected":"disconnected")+(h.age_s!=null?"  ("+h.age_s+"s ago)":""),
+        "underlay: "+(h.iface||"eth1"),
+        "tx: "+tx+"  ·  rx: "+rx,
+        "routes programmed: "+(h.routes||0),
+      ].join("\n");
+    } else if(h&&h.kind==="switch"){
+      tt.textContent=[
+        name+"  ("+h.role+")",
+        "uSID locator: fc00:0:"+h.usid+"::/48",
+        "reachable: "+(h.alive?"yes":"no"),
+        "",
+        "for live SR config dump run on the docker host:",
+        "  ./deploy.sh diag "+name,
+      ].join("\n");
+    } else {
+      tt.textContent=name;
+    }
+    g.appendChild(tt);
     svg.appendChild(g);});}
 function drawTelem(){if(!TELEM)return;
   // adaptive unit display so sub-Gbps real traffic doesn't read as "0"

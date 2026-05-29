@@ -212,7 +212,52 @@ do_destroy() {
   sudo containerlab destroy -t "$TOPO" --cleanup >/dev/null 2>&1 || true
 }
 
-# ---- top level -------------------------------------------------------------
+# ---- diag (live SR config dump for any node) -------------------------------
+do_diag() {
+  local N="${ARG:-}"
+  [ -z "$N" ] && { echo "usage: $0 diag NODE   (nodes: $SWITCHES $HOSTS)"; exit 1; }
+  docker inspect "$N" >/dev/null 2>&1 || { echo "no such container: $N"; exit 1; }
+  install_sudo_shim "$N"
+  case " $SWITCHES " in *" $N "*)
+    echo "== $N · SWITCH SR DIAG =="
+    echo "-- expected SIDs (from frr.conf) --"
+    docker exec "$N" grep -E '^\s+sid\s' /etc/sonic/frr/frr.conf 2>/dev/null | sed 's/^/  /'
+    echo "-- seg6local routes installed in kernel --"
+    docker exec "$N" ip -6 route show table all 2>/dev/null | grep seg6local | sed 's/^/  /'
+    echo "-- interface up/down --"
+    docker exec "$N" sh -c 'show interface status 2>/dev/null | head -8 | sed "s/^/  /"' || \
+      docker exec "$N" ip -br link show | grep -E 'Ethernet|eth1' | sed 's/^/  /'
+    echo "-- seg6_enabled (per-interface) --"
+    docker exec "$N" sh -c 'for f in all default Ethernet0 Ethernet4 Ethernet36 Loopback0 eth1; do
+      v=$(cat /proc/sys/net/ipv6/conf/$f/seg6_enabled 2>/dev/null); fw=$(cat /proc/sys/net/ipv6/conf/$f/forwarding 2>/dev/null)
+      [ -n "$v$fw" ] && printf "  %-12s seg6=%s fwd=%s\n" "$f" "${v:--}" "${fw:--}"
+    done'
+    echo "-- FRR running srv6 --"
+    docker exec "$N" vtysh -c 'show running-config' 2>/dev/null | sed -n '/^segment-routing/,/^!/p' | sed 's/^/  /'
+    return ;;
+  esac
+  case " $HOSTS " in *" $N "*)
+    echo "== $N · HOST DIAG =="
+    echo "-- eth1 address + mtu --"
+    docker exec "$N" ip -6 addr show eth1 2>/dev/null | grep -E 'inet6|mtu' | sed 's/^/  /'
+    echo "-- mrc0 (identity marker) --"
+    docker exec "$N" ip -d link show mrc0 2>/dev/null | sed 's/^/  /' || echo "  (mrc0 not present)"
+    echo "-- encap routes --"
+    docker exec "$N" ip -6 route show 2>/dev/null | grep -E 'encap seg6|seg6local' | sed 's/^/  /'
+    echo "-- seg6_enabled --"
+    docker exec "$N" sh -c 'for f in all default eth1; do
+      v=$(cat /proc/sys/net/ipv6/conf/$f/seg6_enabled 2>/dev/null)
+      [ -n "$v" ] && printf "  %-12s seg6=%s\n" "$f" "$v"
+    done'
+    echo "-- mrc-agent process --"
+    docker exec "$N" pgrep -af 'mrc-agent run' 2>/dev/null | sed 's/^/  /' || echo "  (not running)"
+    echo "-- recent agent log --"
+    docker exec "$N" tail -10 /var/log/mrc-agent.log 2>/dev/null | sed 's/^/  /' || echo "  (no log)"
+    return ;;
+  esac
+  echo "unknown node category: $N"
+}
+
 case "$CMD" in
   up)         do_fabric; do_hosts; do_controller; do_agents; do_verify
               echo "READY. UI: http://localhost:${CTRL_PORT}   Demo: ./deploy.sh demo" ;;
@@ -223,6 +268,7 @@ case "$CMD" in
   verify)     do_verify ;;
   demo)       do_demo ;;
   login)      do_login ;;
+  diag)       do_diag ;;
   destroy)    do_destroy ;;
-  *) echo "usage: $0 {up|fabric|hosts|controller|agents|verify|demo|login|destroy} [arg]"; exit 1 ;;
+  *) echo "usage: $0 {up|fabric|hosts|controller|agents|verify|demo|login|diag|destroy} [arg]"; exit 1 ;;
 esac

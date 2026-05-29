@@ -296,6 +296,49 @@ def api_metrics():
 @app.route("/api/metrics", methods=["GET"])
 def api_metrics_get(): return jsonify(HOST_METRICS)
 
+# --- node health -------------------------------------------------------------
+# For hosts we already have agent metrics. For switches we can't run docker
+# exec from inside the controller container, but the controller IS on the same
+# clab mgmt network, so Docker DNS resolves switch names. A TCP probe to the
+# SONiC SSH port is a sufficient liveness signal — and it's < 100ms per node.
+import socket
+_SWITCH_PROBE_PORT = 22
+_HEALTH_CACHE = {"ts": 0.0, "data": {}}
+def _switch_alive(name, timeout=0.4):
+    try:
+        with socket.create_connection((name, _SWITCH_PROBE_PORT), timeout=timeout):
+            return True
+    except Exception:
+        return False
+def collect_health():
+    """Per-node {alive, age_s, extras}. Cached for 3s — agents post every 1s,
+    switches probe is cheap but not free."""
+    now = time.time()
+    if now - _HEALTH_CACHE["ts"] < 3.0 and _HEALTH_CACHE["data"]:
+        return _HEALTH_CACHE["data"]
+    out = {}
+    for h in FAB.get("hosts", []):
+        m = HOST_METRICS.get(h["name"])
+        age = (now - m["ts"]) if m else None
+        out[h["name"]] = {
+            "kind": "host",
+            "alive": bool(m and age is not None and age < 5),
+            "age_s": round(age, 1) if age is not None else None,
+            "eth_tx_bps": (m or {}).get("eth_tx_bps", 0.0),
+            "eth_rx_bps": (m or {}).get("eth_rx_bps", 0.0),
+            "routes":    (m or {}).get("routes", 0),
+            "iface":     (m or {}).get("iface", "eth1"),
+        }
+    for sw in FAB.get("spines", []) + FAB.get("leaves", []):
+        n = sw["name"]
+        out[n] = {"kind": "switch", "alive": _switch_alive(n),
+                  "usid": sw.get("usid"), "role": "spine" if sw in FAB["spines"] else "leaf"}
+    _HEALTH_CACHE["ts"], _HEALTH_CACHE["data"] = now, out
+    return out
+
+@app.route("/api/health")
+def api_health(): return jsonify(collect_health())
+
 @app.route("/api/telemetry")
 def api_telemetry(): return jsonify(telemetry())
 
