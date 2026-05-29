@@ -38,21 +38,55 @@ peer_of()  { case "$1" in
 esac; }
 
 # ---- fabric ----------------------------------------------------------------
+SWITCH_PORTS="Ethernet0 Ethernet4 Ethernet8 Ethernet12 Ethernet16 Ethernet20 Ethernet24 Ethernet28 Ethernet32 Ethernet36"
+# Per-node End SID (== own locator prefix) and the iface to attach it to.
+# FRR 10.5.4 accepts `behavior uN` in static-sids config but staticd silently
+# fails to push it to zebra/kernel for the locator's own prefix. We work around
+# by installing the End action with seg6local directly. Linux also strips the
+# action when `dev lo`, so we attach to a real interface (any non-lo works
+# since End re-routes after the next-csid shift).
+end_sid_of()    { case "$1" in
+  p0-spine00) echo "fc00:0:10::/48";;
+  p0-spine01) echo "fc00:0:11::/48";;
+  p0-leaf00)  echo "fc00:0:20::/48";;
+  p0-leaf01)  echo "fc00:0:21::/48";;
+esac; }
+end_sid_dev_of(){ case "$1" in
+  p0-spine00|p0-spine01) echo "Ethernet4";;
+  p0-leaf00|p0-leaf01)   echo "Ethernet0";;
+esac; }
+
 push_switch() {
   local N="$1"
   echo "==> $N: pushing static SONiC config"
   install_sudo_shim "$N"
   docker cp "$ROOT/switch-config/$N/config_db.json" "$N:/etc/sonic/config_db.json"
   docker exec "$N" bash -c "sonic-cfggen -j /etc/sonic/config_db.json --write-to-db && supervisorctl restart all" >/dev/null 2>&1 || true
+  # bring switch ports up (community SONiC defaults them admin-down)
+  for IF in $SWITCH_PORTS; do docker exec "$N" config interface startup "$IF" >/dev/null 2>&1 || true; done
   local FRR_DIR=/etc/sonic/frr
   docker exec "$N" mkdir -p "$FRR_DIR" 2>/dev/null || true
   docker cp "$ROOT/switch-config/$N/frr.conf" "$N:$FRR_DIR/frr.conf"
-  docker exec "$N" bash -c "sysctl -w net.ipv6.conf.all.seg6_enabled=1 net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1" || true
+  # seg6_enabled per-interface — `all` only applies to ifaces created AFTER the
+  # sysctl, so we set it explicitly on every existing iface here.
+  docker exec "$N" bash -c '
+    for f in /proc/sys/net/ipv6/conf/*/seg6_enabled; do echo 1 > "$f" 2>/dev/null; done
+    sysctl -w net.ipv6.conf.all.seg6_enabled=1 net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
+  ' || true
   for try in 1 2 3 4; do docker exec "$N" vtysh -f "$FRR_DIR/frr.conf" >/dev/null 2>&1 && break; sleep 1; done
+  # FRR uN workaround: install the End action for this node's locator directly.
+  local SID; SID="$(end_sid_of "$N")"
+  local DEV; DEV="$(end_sid_dev_of "$N")"
+  if [ -n "$SID" ] && [ -n "$DEV" ]; then
+    docker exec "$N" ip -6 route replace "$SID" \
+      encap seg6local action End flavors next-csid lblen 32 nflen 16 dev "$DEV" 2>/dev/null || true
+  fi
 }
 verify_switch_sids() {
   local N="$1"; local want have
   want=$(grep -cE '^[[:space:]]+sid[[:space:]]' "$ROOT/switch-config/$N/frr.conf" || true)
+  # count any seg6local route (whether FRR-programmed or ip-route-installed by
+  # the workaround above)
   have=$(docker exec "$N" ip -6 route show table all 2>/dev/null | grep -c seg6local || true)
   printf "  %-15s want=%s  have=%s  %s\n" "$N" "$want" "$have" "$([ "$have" -ge "$want" ] && echo OK || echo MISSING)"
 }
@@ -75,10 +109,17 @@ configure_host() {
   docker exec "$H" bash -c "
     ip -6 addr replace ${P}::2/64 dev eth1
     ip link set eth1 up
+    # Lower MTU on eth1 so encap'd packets (inner + ~64B SRv6 overhead) still
+    # fit the switch underlay MTU (9100). Without this, TCP MSS is computed
+    # from 9100 and after encap packets exceed the underlay MTU and get
+    # dropped — visible as iperf3 'retransmit storm with 0 bps'.
+    ip link set eth1 mtu 9000
     ip -6 route replace fc00:0000::/32 via ${P}::1 dev eth1
     ip -6 route replace 2001:db8:cccc::/48 via ${P}::1 dev eth1
     ip -6 route replace fc00:0000:d001::/48 dev eth1 encap seg6local action End.DT6 table 0
     sysctl -w net.ipv6.fib_multipath_hash_policy=1 >/dev/null 2>&1
+    # seg6_enabled per-interface (see push_switch comment for why)
+    sysctl -w net.ipv6.conf.eth1.seg6_enabled=1 net.ipv6.conf.all.seg6_enabled=1 >/dev/null 2>&1
   " 2>/dev/null || true
   read -r PADDR PSTACK <<<"$(peer_of "$H")"
   docker exec "$H" bash -c "ip -6 route replace ${PADDR}/128 encap seg6 mode encap segs ${PSTACK} dev eth1" 2>/dev/null || true

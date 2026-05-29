@@ -80,7 +80,7 @@
     <div class="card"><h2><span>Fabric · spine / leaf · live throughput</span><span id="t-model" style="color:#3b4654"></span></h2>
       <div class="body"><svg id="topo" viewBox="0 0 880 430"></svg>
         <div class="tstrip">
-          <div><div class="lbl">aggregate</div><div class="big"><span id="t-total">0</span> <span style="font-size:13px">Gbps</span></div></div>
+          <div><div class="lbl">aggregate</div><div class="big"><span id="t-total">0</span> <span id="t-unit" style="font-size:13px">Gbps</span></div></div>
           <div><div class="lbl">paths in spray</div><div class="big" style="color:var(--amber)"><span id="t-n">0</span></div></div>
           <div><div class="lbl">offered rate (Gbps)</div><input id="t-offer" type="number" min="1" step="10"></div>
         </div>
@@ -115,6 +115,11 @@ function layout(){POS={};const W=880;
   const n=TOPO.hosts.length;TOPO.hosts.forEach((h,i)=>{POS[h.name]={x:(W*(i+1)/(n+1))-30,y:360,w:60,h:34,label:h.name,host:true};});}
 function ctr(n){const p=POS[n];return p?{x:p.x+p.w/2,y:p.y+p.h/2}:null;}
 function activeChains(){return PATHS.filter(p=>PROFILE.active_paths.includes(p.id)&&p.status==="good").map(p=>p.segments_nodes);}
+function fmtRate(g){const x=Number(g)||0;
+  if(x>=1)return x.toFixed(2)+"G";
+  if(x>=0.001)return (x*1000).toFixed(0)+"M";
+  if(x>0)return (x*1e6).toFixed(0)+"K";
+  return "0";}
 function drawTopo(){
   const svg=document.getElementById("topo"),ns="http://www.w3.org/2000/svg";svg.innerHTML="";layout();
   const chains=activeChains();
@@ -128,10 +133,13 @@ function drawTopo(){
     ln.setAttribute("x2",cb.x);ln.setAttribute("y2",cb.y);let cls="lnk";
     if(denyset.has(a+">"+b))cls+=" deny";else if(aset.has(a+">"+b))cls+=" active";
     ln.setAttribute("class",cls);
-    if(aset.has(a+">"+b)){const off=TELEM?TELEM.offered_gbps:100;ln.setAttribute("stroke-width",(2+4.5*Math.min(1,bps/off)).toFixed(1));}
+    // line-width scales by aggregate (not fixed offered) so tiny real flows
+    // are still visually proportional. Floor at 1G so dim links stay readable.
+    if(aset.has(a+">"+b)){const scale=Math.max(TELEM?TELEM.total_gbps:0,1);
+      ln.setAttribute("stroke-width",(2+4.5*Math.min(1,bps/scale)).toFixed(1));}
     svg.appendChild(ln);
-    if(bps>0.1){const t=document.createElementNS(ns,"text");t.setAttribute("x",(ca.x+cb.x)/2+6);t.setAttribute("y",(ca.y+cb.y)/2-3);
-      t.setAttribute("class","bps");t.textContent=bps.toFixed(0)+"G";svg.appendChild(t);}});
+    if(bps>0.00001){const t=document.createElementNS(ns,"text");t.setAttribute("x",(ca.x+cb.x)/2+6);t.setAttribute("y",(ca.y+cb.y)/2-3);
+      t.setAttribute("class","bps");t.textContent=fmtRate(bps);svg.appendChild(t);}});
   chains.forEach(c=>{const pts=c.map(ctr).filter(Boolean);if(pts.length<2)return;
     const pkt=document.createElementNS(ns,"circle");pkt.setAttribute("r","3.5");pkt.setAttribute("class","pkt");svg.appendChild(pkt);
     const am=document.createElementNS(ns,"animateMotion");am.setAttribute("dur","1.8s");am.setAttribute("repeatCount","indefinite");
@@ -146,11 +154,17 @@ function drawTopo(){
       u.setAttribute("text-anchor","middle");u.setAttribute("class","u");u.textContent=":"+p.usid;g.appendChild(u);}
     svg.appendChild(g);});}
 function drawTelem(){if(!TELEM)return;
-  document.getElementById("t-total").textContent=TELEM.total_gbps.toFixed(0);
+  // adaptive unit display so sub-Gbps real traffic doesn't read as "0"
+  const g=TELEM.total_gbps;
+  const totEl=document.getElementById("t-total"),unitEl=document.getElementById("t-unit");
+  if(g>=1){totEl.textContent=g.toFixed(2);unitEl.textContent="Gbps";}
+  else if(g>=0.001){totEl.textContent=(g*1000).toFixed(1);unitEl.textContent="Mbps";}
+  else if(g>0){totEl.textContent=(g*1e6).toFixed(0);unitEl.textContent="Kbps";}
+  else {totEl.textContent="0";unitEl.textContent="Gbps";}
   document.getElementById("t-n").textContent=TELEM.n_active;
   document.getElementById("t-model").textContent=TELEM.model;
   const off=document.getElementById("t-offer");if(document.activeElement!==off)off.value=TELEM.offered_gbps;
-  const sp=Object.entries(TELEM.per_path).map(([id,g])=>`${id}: <span style="color:var(--cyan)">${g.toFixed(0)}G</span>`).join("  ·  ");
+  const sp=Object.entries(TELEM.per_path).map(([id,g])=>`${id}: <span style="color:var(--cyan)">${fmtRate(g)}</span>`).join("  ·  ");
   document.getElementById("t-split").innerHTML=sp?("split → "+sp):"";}
 function drawModes(){const el=document.getElementById("modes");el.innerHTML="";
   Object.keys(window.MODES).forEach(m=>{const b=document.createElement("button");b.textContent=m.toUpperCase();
@@ -167,7 +181,7 @@ function render(){
   const pe=document.getElementById("paths");pe.innerHTML="";
   PATHS.forEach(p=>{const active=PROFILE.active_paths.includes(p.id);const d=document.createElement("div");d.className="path"+(active?" active":"");
     const chips=p.segments_nodes.map(s=>`<span class="chip">${s}</span>`).join('<span class="arr">→</span>');
-    const bw=TELEM&&TELEM.per_path[p.id]?TELEM.per_path[p.id].toFixed(0)+"G":(active?"…":"idle");
+    const bw=TELEM&&TELEM.per_path[p.id]?fmtRate(TELEM.per_path[p.id]):(active?"…":"idle");
     d.innerHTML=`<div class="top"><span class="name"><span class="dot ${p.status}"></span>${p.id}</span>
       <div class="btns"><button class="tg spray ${active?'on':''}">${active?'● spray':'+ spray'}</button>
       <button class="tg deny-btn">${p.status==='good'?'deny':'restore'}</button></div></div>

@@ -125,22 +125,24 @@ class Dataplane:
         return r.returncode, r.stderr or ""
 
     def bring_up(self):
+        # mrc0 is a marker/identity dummy. The tenant address itself stays on
+        # the underlay (eth1) where the leaf's uA SID needs it to be ND-resolvable
+        # as a nexthop. Putting the address on mrc0 as well (with /128 winning
+        # longest-prefix-match) routed decapped packets into the dummy and
+        # silently dropped them — discovered the hard way.
         if self.dry:
             for c in [["link", "add", self.iface, "type", "dummy"],
-                      ["link", "set", self.iface, "up"],
-                      ["-6", "addr", "replace", f"{self.tenant}/128", "dev", self.iface]]:
+                      ["link", "set", self.iface, "up"]]:
                 self._ip(c)
-            print(f"[dp:dry] {self.iface} up, tenant {self.tenant}/128, underlay={self.underlay}")
+            print(f"[dp:dry] {self.iface} up (marker), tenant {self.tenant} on underlay={self.underlay}")
             return
         if run(["ip", "link", "show", self.iface], capture=True).returncode != 0:
             self._ip(["link", "add", self.iface, "type", "dummy"])
         self._ip(["link", "set", self.iface, "up"])
-        self._ip(["-6", "addr", "replace", f"{self.tenant}/128", "dev", self.iface])
         run("sysctl -w net.ipv6.fib_multipath_hash_policy=1 >/dev/null 2>&1", capture=True)
-        print(f"[dp] {self.iface} up, tenant {self.tenant}/128, underlay={self.underlay}")
+        print(f"[dp] {self.iface} up (marker), tenant {self.tenant} on underlay={self.underlay}")
 
     def tear_down(self):
-        self._ip(["-6", "addr", "del", f"{self.tenant}/128", "dev", self.iface])
         self._ip(["link", "del", self.iface])
 
     def _underlay_gateway(self):
