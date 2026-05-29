@@ -19,7 +19,7 @@ SWITCHES="p0-spine00 p0-spine01 p0-leaf00 p0-leaf01"
 HOSTS="host00 host01"
 CTRL_NAME="mrc-controller"
 CTRL_IMG="mrc-controller:dev"
-CTRL_NET="mrcsrv6_mgmt"
+CTRL_NET="mrcsrv6_mgmt"   # name comes from topology.clab.yaml mgmt block
 CTRL_IP="172.20.18.213"
 CTRL_PORT="9810"
 

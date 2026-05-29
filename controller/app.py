@@ -217,8 +217,10 @@ def api_profile_stream():
         try:
             yield "data: " + json.dumps(build_profile()) + "\n\n"
             while True:
-                try: yield q.get(timeout=20)
-                except queue.Empty: yield ": keepalive\n\n"   # SSE comment, keeps the conn alive
+                # keepalive every 5s; agents have a 60s socket read timeout, so
+                # this keeps the connection healthy through any quiet period
+                try: yield q.get(timeout=5)
+                except queue.Empty: yield ": keepalive\n\n"
         finally:
             with _subs_lock:
                 try: _subscribers.remove(q)

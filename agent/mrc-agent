@@ -143,6 +143,19 @@ class Dataplane:
         self._ip(["-6", "addr", "del", f"{self.tenant}/128", "dev", self.iface])
         self._ip(["link", "del", self.iface])
 
+    def _underlay_gateway(self):
+        """Find an IPv6 gateway reachable via the underlay, by inspecting the
+        existing route to the uSID block (installed by deploy.sh hosts).
+        Linux requires `via <gw>` on each nexthop for IPv6 multipath."""
+        if self.dry: return "fe80::1"
+        for target in ["fc00:0000::/32", "2001:db8:cccc::/48"]:
+            r = run(["ip", "-6", "route", "show", target], capture=True)
+            if r.returncode != 0 or not r.stdout: continue
+            toks = r.stdout.split()
+            if "via" in toks:
+                return toks[toks.index("via") + 1]
+        return None
+
     def program(self, peer_dst, usid_stacks):
         if not peer_dst or not usid_stacks: return False, "empty profile"
         cmd = ["ip", "-6", "route", "replace", f"{peer_dst}/128"]
@@ -150,9 +163,14 @@ class Dataplane:
             cmd += ["encap", "seg6", "mode", "encap", "segs", usid_stacks[0],
                     "dev", self.underlay]
         else:
+            gw = self._underlay_gateway()
+            if not gw:
+                err = (f"no IPv6 gateway found on {self.underlay} — IPv6 multipath "
+                       f"requires `via <gw>` per nexthop")
+                sys.stderr.write(f"[dp] {err}\n"); return False, err
             for u in usid_stacks:
                 cmd += ["nexthop", "encap", "seg6", "mode", "encap", "segs", u,
-                        "dev", self.underlay, "weight", "1"]
+                        "via", gw, "dev", self.underlay, "weight", "1"]
         if self.dry:
             print("[dry] " + " ".join(cmd))
         else:
@@ -222,7 +240,8 @@ def sse_subscribe(url, on_message, on_status, stop_evt):
             on_status("connecting", reconnects=reconnects)
             print(f"[sse] connecting to {url}")
             req = urlreq.Request(url, headers={"Accept": "text/event-stream"})
-            with urlreq.urlopen(req, timeout=10) as resp:
+            # 60s read timeout — server keepalive is every 5s so we're well-padded
+            with urlreq.urlopen(req, timeout=60) as resp:
                 print(f"[sse] connected (HTTP {resp.status})")
                 on_status("connected", reconnects=reconnects)
                 backoff = RECONNECT_BASE
@@ -280,13 +299,27 @@ def cmd_run(args):
         dst = p.get("active_dst") or (p.get("flow") or {}).get("dst_addr")
         stacks = [e["usid"] for e in (p.get("active_evs") or []) if e.get("usid")]
         if not stacks and p.get("active_usid"): stacks = [p["active_usid"]]
-        print(f"[push] mode={p.get('mode')} paths={len(stacks)} dst={dst}")
 
         c = state.data["controller"]
         state.update("controller",
                      events_received=c.get("events_received", 0) + 1,
                      last_event_at=time.time())
         state.set("profile", {**p, "received_at": time.time()})
+
+        # Only the source host of the flow programs the encap route. The
+        # destination already decaps natively via its End.DT6 SID and replies
+        # over its own baseline route; installing a self-encap on the dest
+        # would shadow that with a loop via the fabric.
+        flow_src = (p.get("flow") or {}).get("src")
+        if flow_src and flow_src != args.host:
+            print(f"[push] mode={p.get('mode')} paths={len(stacks)} dst={dst} "
+                  f"(this host is not the source — no route programmed)")
+            state.update("kernel", route_dst=None, n_paths=0,
+                         last_program_at=time.time(),
+                         last_program_ok=None, last_program_error=None)
+            return
+
+        print(f"[push] mode={p.get('mode')} paths={len(stacks)} dst={dst}")
         if dst and stacks:
             ok, err = dp.program(dst, stacks)
             state.update("kernel",
