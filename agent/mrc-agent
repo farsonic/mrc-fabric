@@ -158,7 +158,8 @@ class Dataplane:
                 return toks[toks.index("via") + 1]
         return None
 
-    def program(self, peer_dst, usid_stacks):
+    def program_srv6(self, peer_dst, usid_stacks):
+        """SRv6 kernel encap (single uSID or ECMP multipath). Returns (ok, err)."""
         if not peer_dst or not usid_stacks: return False, "empty profile"
         cmd = ["ip", "-6", "route", "replace", f"{peer_dst}/128"]
         if len(usid_stacks) == 1:
@@ -183,8 +184,20 @@ class Dataplane:
         self.installed_route_dst = peer_dst
         self.installed_segs = list(usid_stacks)
         kind = "ECMP" if len(usid_stacks) > 1 else "single"
-        print(f"[dp] route -> {peer_dst} via {kind} ({len(usid_stacks)} path)")
+        print(f"[dp] srv6 route -> {peer_dst} via {kind} ({len(usid_stacks)} path)")
         return True, None
+
+    def clear_encap(self, peer_dst):
+        """Remove any agent-installed encap route to peer_dst. Used between
+        mode switches so a leftover SRv6 route doesn't shadow plain RoCE or
+        app-driven UDP/STEV encap on the next mode."""
+        if not peer_dst: return
+        if self.dry:
+            print(f"[dry] ip -6 route del {peer_dst}/128 (clear)")
+        else:
+            run(["ip", "-6", "route", "del", f"{peer_dst}/128"], capture=True)
+        self.installed_route_dst = None
+        self.installed_segs = []
 
 # ---- counters -------------------------------------------------------------
 def _stats(iface):
@@ -298,9 +311,14 @@ def cmd_run(args):
         state.update("controller", **upd)
 
     def on_profile(p):
-        dst = p.get("active_dst") or (p.get("flow") or {}).get("dst_addr")
-        stacks = [e["usid"] for e in (p.get("active_evs") or []) if e.get("usid")]
+        mode = (p.get("mode") or "").lower()
+        flow = p.get("flow") or {}
+        dst = p.get("active_dst") or flow.get("dst_addr")
+        evs = p.get("active_evs") or []
+        stacks = [e["usid"] for e in evs if e.get("usid")]
         if not stacks and p.get("active_usid"): stacks = [p["active_usid"]]
+        # for UDP/STEV the EV itself doubles as a UDP src-port hint for apps
+        ev_ports = [int(e["entropy"]) for e in evs if isinstance(e.get("entropy"), int)]
 
         c = state.data["controller"]
         state.update("controller",
@@ -308,26 +326,55 @@ def cmd_run(args):
                      last_event_at=time.time())
         state.set("profile", {**p, "received_at": time.time()})
 
-        # Only the source host of the flow programs the encap route. The
-        # destination already decaps natively via its End.DT6 SID and replies
-        # over its own baseline route; installing a self-encap on the dest
-        # would shadow that with a loop via the fabric.
-        flow_src = (p.get("flow") or {}).get("src")
-        if flow_src and flow_src != args.host:
-            print(f"[push] mode={p.get('mode')} paths={len(stacks)} dst={dst} "
-                  f"(this host is not the source — no route programmed)")
-            state.update("kernel", route_dst=None, n_paths=0,
+        # Only the source host of the flow programs anything. The destination
+        # already decaps natively via its End.DT6 SID (SRv6) or just receives
+        # plain RoCEv2 (UDP/STEV/none).
+        if flow.get("src") and flow.get("src") != args.host:
+            print(f"[push] mode={mode} paths={len(stacks)} dst={dst} "
+                  f"(this host is not the source — no programming)")
+            state.update("kernel", route_dst=None, n_paths=0, last_mode=mode,
                          last_program_at=time.time(),
                          last_program_ok=None, last_program_error=None)
             return
 
-        print(f"[push] mode={p.get('mode')} paths={len(stacks)} dst={dst}")
-        if dst and stacks:
-            ok, err = dp.program(dst, stacks)
-            state.update("kernel",
-                         route_dst=dst, n_paths=len(stacks),
+        # Clear any stale encap from a previous mode before re-programming.
+        # Without this, a leftover SRv6 route would shadow a later UDP/none mode.
+        if dst:
+            dp.clear_encap(dst)
+
+        if mode == "srv6":
+            if dst and stacks:
+                ok, err = dp.program_srv6(dst, stacks)
+            else:
+                ok, err = False, "no segments"
+            state.update("kernel", route_dst=dst, n_paths=len(stacks), last_mode=mode,
                          last_program_at=time.time(),
                          last_program_ok=ok, last_program_error=err)
+            print(f"[push] mode=srv6 paths={len(stacks)} dst={dst} ok={ok}")
+
+        elif mode in ("udp", "stev"):
+            # No kernel encap. The MRC-aware app (rocebench) reads active_evs
+            # from /run/mrc-agent.json and encodes EV in its RoCEv2 UDP source
+            # port (UDP) or structured into UDP src per the STEV bit layout.
+            print(f"[push] mode={mode} ev_ports={ev_ports} — state published, "
+                  f"encap is app-driven (no kernel routes installed)")
+            state.update("kernel", route_dst=None, n_paths=len(ev_ports),
+                         last_mode=mode, last_program_at=time.time(),
+                         last_program_ok=True, last_program_error=None)
+
+        elif mode in ("none", "ipv4", ""):
+            # Plain RoCEv2, no MRC. The app talks to dst as a normal IPv4 (or
+            # IPv6) peer; switches L4-hash on whatever 5-tuple the app exposes.
+            print(f"[push] mode={mode or 'none'} — plain RoCEv2, no MRC encap")
+            state.update("kernel", route_dst=None, n_paths=0, last_mode=mode,
+                         last_program_at=time.time(),
+                         last_program_ok=True, last_program_error=None)
+
+        else:
+            print(f"[push] mode={mode}: unrecognized — leaving dataplane alone")
+            state.update("kernel", route_dst=None, n_paths=0, last_mode=mode,
+                         last_program_at=time.time(),
+                         last_program_ok=False, last_program_error=f"unknown mode '{mode}'")
 
     try:
         sse_subscribe(f"{args.controller.rstrip('/')}/api/profile/stream",
@@ -401,22 +448,40 @@ def render_status(s):
     if c.get("last_error"):    lines.append(f"        last error: {c['last_error']}")
     lines.append("")
     if p:
-        mode = (p.get("mode") or "-").upper()
+        mode = (p.get("mode") or "-").lower()
         mp = " · multipath" if p.get("multipath") else ""
         flow = p.get("flow") or {}
-        lines.append(f"  EV PROFILE  (mode {mode}{mp})")
+        lines.append(f"  EV PROFILE  (mode {mode.upper()}{mp})")
         lines.append(f"    flow      {flow.get('src','?')} → {flow.get('dst','?')} ({flow.get('dst_addr','-')})")
         evs = p.get("active_evs") or []
-        # Build a {usid -> {id, spine}} lookup from the full evs list (the
-        # active_evs payload itself only carries entropy+usid).
         by_usid = {e.get("usid"): e for e in (p.get("evs") or []) if e.get("usid")}
-        if evs:
-            for e in evs:
-                full = by_usid.get(e["usid"], {})
-                pid  = full.get("id", "via-?")
-                lines.append(f"    [✓] {pid:<18} EV {e['entropy']:>5}    {e['usid']}")
+        if mode == "srv6":
+            if evs:
+                for e in evs:
+                    full = by_usid.get(e["usid"], {})
+                    pid  = full.get("id", "via-?")
+                    lines.append(f"    [✓] {pid:<18} EV {e['entropy']:>5}    {e['usid']}")
+            else:
+                lines.append("    (no active EVs)")
+        elif mode in ("udp", "stev"):
+            if evs:
+                lines.append(f"    encap     app-driven RoCEv2/UDP — EV in UDP source port")
+                for e in evs:
+                    # match the EV back to its path label via the full evs list
+                    pid = "via-?"
+                    for full in p.get("evs") or []:
+                        if full.get("entropy") == e.get("entropy"):
+                            pid = full.get("id", pid); break
+                    if mode == "stev":
+                        lines.append(f"    [✓] {pid:<18} STEV {e['entropy']:>5}  (srcport ← STEV(path,flow))")
+                    else:
+                        lines.append(f"    [✓] {pid:<18} EV {e['entropy']:>5}    (srcport ← EV)")
+            else:
+                lines.append("    (no active EVs)")
+        elif mode in ("none", "ipv4", ""):
+            lines.append("    plain RoCEv2 — no MRC encap; underlay does L4-hash ECMP")
         else:
-            lines.append("    (no active EVs in profile)")
+            lines.append(f"    (unrecognized mode '{mode}')")
     else:
         lines.append("  EV PROFILE  (none received yet)")
     lines.append("")
@@ -475,6 +540,244 @@ def cmd_test(args):
     if not stop.is_set(): print("[test] timeout"); sys.exit(2)
     print("[test] OK")
 
+# ---- monitor (rich live TUI) -----------------------------------------------
+SS_BIN = "ss"
+def _ss_flows(iface_addr):
+    """Parse `ss -tn6 -i -o state established`. Returns flows whose local
+    or peer address matches the host's tenant."""
+    if not iface_addr: return []
+    r = run([SS_BIN, "-tn6", "-i", "-o", "state", "established"], capture=True)
+    if r.returncode != 0 or not r.stdout: return []
+    flows = []; cur = None
+    for line in r.stdout.splitlines():
+        if not line.strip(): continue
+        if line.startswith(("Recv-Q", "State", "Netid")): continue
+        if not line.startswith((" ", "\t")):
+            parts = line.split()
+            if len(parts) < 4: continue
+            try:
+                local, peer = parts[-2], parts[-1]
+                la, lp = local.rsplit(":", 1); pa, pp = peer.rsplit(":", 1)
+                la, pa = la.strip("[]"), pa.strip("[]")
+                if iface_addr not in la and iface_addr not in pa:
+                    cur = None; continue
+                cur = {"sport": lp, "dport": pp, "src": la, "dst": pa,
+                       "cwnd": None, "rtt": None, "retr": 0, "mss": 0,
+                       "bytes_sent": 0, "segs_out": 0, "segs_in": 0}
+                flows.append(cur)
+            except Exception: cur = None
+            continue
+        if cur is None: continue
+        for tok in line.strip().split():
+            if ":" not in tok: continue
+            k, _, v = tok.partition(":")
+            try:
+                if k == "cwnd":        cur["cwnd"] = int(v)
+                elif k == "rtt":       cur["rtt"]  = float(v.split("/")[0])
+                elif k == "retrans":   cur["retr"] = int(v.split("/")[-1])
+                elif k == "bytes_sent":cur["bytes_sent"] = int(v)
+                elif k == "segs_out":  cur["segs_out"]   = int(v)
+                elif k == "segs_in":   cur["segs_in"]    = int(v)
+                elif k == "mss":       cur["mss"]        = int(v)
+            except Exception: pass
+    return flows
+
+def _flow_path_seg(dst_addr, sport, dport):
+    """Ask the kernel which nexthop's encap segs it would pick for this
+    5-tuple. Returns the inner uSID string or None."""
+    if not dst_addr: return None
+    r = run(["ip","-6","route","get",dst_addr,"sport",str(sport),"dport",str(dport)],
+            capture=True)
+    if r.returncode != 0 or not r.stdout: return None
+    out = r.stdout.strip()
+    if "[" in out and "]" in out:
+        return out[out.index("[")+1:out.index("]")].strip()
+    return None
+
+def _snmp6():
+    out = {}
+    try:
+        for ln in open("/proc/net/snmp6"):
+            k, _, v = ln.strip().partition(" "); v = v.strip()
+            if v.isdigit() and k in (
+                "Ip6InReceives","Ip6InDelivers","Ip6OutForwDatagrams",
+                "Ip6InDiscards","Ip6OutDiscards","Ip6InAddrErrors",
+                "Ip6InHdrErrors","Ip6InNoRoutes","Ip6InTruncatedPkts",
+                "Ip6OutNoRoutes"):
+                out[k] = int(v)
+    except Exception: pass
+    return out
+
+def _iface_stats(iface):
+    s = {}
+    for k in ("tx_bytes","rx_bytes","tx_packets","rx_packets","tx_errors","rx_errors","tx_dropped","rx_dropped"):
+        try: s[k] = int(open(f"/sys/class/net/{iface}/statistics/{k}").read())
+        except Exception: s[k] = 0
+    return s
+
+def _bar(frac, w=22): n = int(round(max(0.0, min(1.0, frac)) * w)); return "█"*n + "░"*(w-n)
+def _ucwnd(c): return f"{c/1000:.1f}K" if c and c>=1000 else (str(c) if c else "—")
+def _ubps(b, dt):
+    bps = (b*8.0) / max(dt, 1e-9)
+    if bps >= 1e9: return f"{bps/1e9:.2f}G"
+    if bps >= 1e6: return f"{bps/1e6:.1f}M"
+    if bps >= 1e3: return f"{bps/1e3:.0f}K"
+    return f"{bps:.0f}"
+
+def cmd_monitor(args):
+    """Live TUI: per-flow cwnd/rtt/retr, aggregate bytes/pkts, IPv6 fabric
+    counters, mode-specific overlay, and per-path attribution for SRv6 ECMP.
+    q to quit, r to reset deltas."""
+    path = resolve_state_path(args.state)
+    last_iface_snap = None; last_iface = None
+    last_flow_snap = {}; last_t = time.time()
+    import select, tty, termios
+    # put stdin in raw cbreak so single-key input is responsive
+    old_tty = None
+    try:
+        if sys.stdin.isatty():
+            old_tty = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+        while True:
+            s = _read_state(path)
+            now = time.time(); dt = max(now - last_t, 1e-3)
+            a = s["agent"]; c = s["controller"]; p = s.get("profile") or {}; k = s["kernel"]
+            mode = (p.get("mode") or "").lower()
+            iface = a.get("underlay", "eth1")
+            iface_snap = _iface_stats(iface)
+            flows = _ss_flows(a.get("tenant", ""))
+
+            for f in flows:
+                key = (f["sport"], f["dport"], f["src"], f["dst"])
+                prev = last_flow_snap.get(key)
+                if prev:
+                    f["dbytes"] = max(f["bytes_sent"] - prev["bytes_sent"], 0)
+                    f["dacks"]  = max(f["segs_in"]    - prev["segs_in"],    0)
+                    f["dsegs"]  = max(f["segs_out"]   - prev["segs_out"],   0)
+                    f["dretr"]  = max(f["retr"]       - prev["retr"],       0)
+                else:
+                    f["dbytes"] = f["dacks"] = f["dsegs"] = f["dretr"] = 0
+                last_flow_snap[key] = {"bytes_sent": f["bytes_sent"],
+                                       "segs_in": f["segs_in"],
+                                       "segs_out": f["segs_out"],
+                                       "retr": f["retr"]}
+                f["path"] = None
+                if mode == "srv6" and k.get("n_paths", 0) > 1 and k.get("route_dst"):
+                    f["path"] = _flow_path_seg(k["route_dst"], f["sport"], f["dport"])
+
+            if last_iface_snap and last_iface == iface:
+                dtx  = max(iface_snap["tx_bytes"]   - last_iface_snap["tx_bytes"],   0)
+                drx  = max(iface_snap["rx_bytes"]   - last_iface_snap["rx_bytes"],   0)
+                dtxp = max(iface_snap["tx_packets"] - last_iface_snap["tx_packets"], 0)
+                drxp = max(iface_snap["rx_packets"] - last_iface_snap["rx_packets"], 0)
+            else:
+                dtx = drx = dtxp = drxp = 0
+            last_iface_snap = iface_snap; last_iface = iface; last_t = now
+            sn = _snmp6()
+
+            buf = ["\033[2J\033[H"]
+            badge, lbl = _ctrl_badge(c.get("status", "?"))
+            upt = a.get("uptime_s", 0)
+            ustr = f"{upt//3600}h{(upt%3600)//60:02d}m" if upt>=3600 else f"{upt//60}m{upt%60:02d}s" if upt>=60 else f"{upt}s"
+            mp = " · MULTIPATH" if p.get("multipath") else ""
+            buf.append(f"╭─ mrc-agent · LIVE MONITOR ─── mode \033[36m{mode.upper() or '—'}\033[0m{mp} ─── q quit · r reset ─╮")
+            buf.append(f"│ host       {a.get('host','-')} → {(p.get('flow') or {}).get('dst','-')}    underlay {iface}    up {ustr}")
+            buf.append(f"│ ctrl       [{badge}] {lbl}    events {c.get('events_received',0)}    last push {_age(c.get('last_event_at'))}")
+            if k.get("route_dst"):
+                kind = "ECMP" if k.get("n_paths",0) > 1 else "single"
+                buf.append(f"│ kernel     route → {k['route_dst']}  ({kind} · {k.get('n_paths',0)} path)")
+            else:
+                buf.append(f"│ kernel     no encap route (mode={mode or 'none'} — app-driven or plain)")
+            buf.append("╰" + "─" * 86)
+            buf.append("")
+
+            evs = p.get("active_evs") or []
+            buf.append(f"  ACTIVE  {len(evs)} path(s)")
+            for e in evs:
+                pid = "via-?"
+                for full in p.get("evs") or []:
+                    if full.get("entropy") == e.get("entropy"): pid = full.get("id", pid); break
+                if mode == "srv6":
+                    buf.append(f"    [✓] {pid:<18} EV {str(e.get('entropy','-')):>5}    \033[33m{e.get('usid','-')}\033[0m")
+                elif mode in ("udp","stev"):
+                    src_hint = "STEV(path,flow)" if mode=="stev" else "EV"
+                    buf.append(f"    [✓] {pid:<18} EV {str(e.get('entropy','-')):>5}    udp.srcport ← {src_hint}")
+                else:
+                    buf.append(f"    [✓] {pid:<18} (plain RoCEv2 / no MRC)")
+            buf.append("")
+
+            buf.append(f"  FLOWS ({len(flows)} established)                                          dt={dt*1000:.0f}ms")
+            buf.append("    sport  dport      cwnd     rtt(ms)  retr   acks/s   bytes/s   path")
+            buf.append("    " + "─" * 80)
+            for f in sorted(flows, key=lambda x: int(x.get("sport","0") or 0)):
+                pp = "—"
+                if f.get("path"):
+                    seg = f["path"]
+                    if seg.startswith("fc00:0:"):
+                        rest = seg[len("fc00:0:"):]
+                        pp = "sp" + rest.split(":",1)[0]
+                    else: pp = seg[:8]
+                rtt = f.get("rtt") or 0.0
+                buf.append(f"    {f['sport']:>5}  {f['dport']:>5}  {_ucwnd(f['cwnd']):>8}   "
+                           f"{rtt:>6.2f}  {f['retr']:>4}   {int(f['dacks']/dt):>6}  "
+                           f"{_ubps(f['dbytes'], dt):>8}   {pp}")
+            buf.append("")
+
+            buf.append(f"  COUNTERS · underlay {iface}                                       rate over {dt*1000:.0f}ms")
+            buf.append(f"    tx     {iface_snap['tx_bytes']:>14,} B  ({iface_snap['tx_packets']:>10,} pkts)   {_ubps(dtx, dt):>8}bps · {int(dtxp/dt):>6} pps")
+            buf.append(f"    rx     {iface_snap['rx_bytes']:>14,} B  ({iface_snap['rx_packets']:>10,} pkts)   {_ubps(drx, dt):>8}bps · {int(drxp/dt):>6} pps")
+            buf.append(f"    errors tx={iface_snap['tx_errors']} drop={iface_snap['tx_dropped']}    rx errs={iface_snap['rx_errors']} drop={iface_snap['rx_dropped']}")
+            buf.append("")
+
+            tot_acks = sum(f["segs_in"]  for f in flows)
+            tot_retr = sum(f["retr"]     for f in flows)
+            tot_segs = sum(f["segs_out"] for f in flows)
+            d_acks   = sum(f["dacks"]    for f in flows)
+            d_retr   = sum(f["dretr"]    for f in flows)
+            buf.append("  TCP DERIVED                                                              /s")
+            buf.append(f"    ACKs received     {tot_acks:>14,}                                  {int(d_acks/dt):>8}")
+            buf.append(f"    segs sent         {tot_segs:>14,}")
+            buf.append(f"    retrans (≈NACK)   {tot_retr:>14,}                                  {int(d_retr/dt):>8}")
+            buf.append("    (true RoCE ACK/NACK/SACK counters require a real IB device)")
+            buf.append("")
+
+            buf.append("  IPv6 FABRIC")
+            buf.append(f"    in receives     {sn.get('Ip6InReceives',0):>12,}     in delivers   {sn.get('Ip6InDelivers',0):>12,}")
+            buf.append(f"    out forw        {sn.get('Ip6OutForwDatagrams',0):>12,}     in no route   {sn.get('Ip6InNoRoutes',0):>12,}")
+            buf.append(f"    in discards     {sn.get('Ip6InDiscards',0):>12,}     in addr err   {sn.get('Ip6InAddrErrors',0):>12,}")
+            buf.append("")
+
+            if mode == "srv6" and k.get("n_paths",0) > 1 and flows:
+                by = {}
+                for f in flows:
+                    pp = f.get("path") or "—"
+                    by.setdefault(pp, {"bytes": 0, "n": 0})
+                    by[pp]["bytes"] += f["dbytes"]; by[pp]["n"] += 1
+                total = sum(v["bytes"] for v in by.values()) or 1
+                buf.append("  PATH DISTRIBUTION (kernel 5-tuple hash, observed)")
+                for pp, v in sorted(by.items()):
+                    pct = v["bytes"] / total
+                    label = pp
+                    if pp and pp.startswith("fc00:0:"):
+                        rest = pp[len("fc00:0:"):]
+                        label = "via-sp" + rest.split(":",1)[0]
+                    buf.append(f"    {label:<22} {_bar(pct):<22} {_ubps(v['bytes'], dt):>8}bps  ({pct*100:>4.1f}%)  flows={v['n']}")
+                buf.append("")
+
+            sys.stdout.write("\n".join(buf)); sys.stdout.write("\n"); sys.stdout.flush()
+
+            if select.select([sys.stdin], [], [], args.interval)[0]:
+                ch = sys.stdin.read(1)
+                if ch in ("q", "Q"): break
+                if ch == "r":
+                    last_flow_snap.clear(); last_iface_snap = None
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if old_tty is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
+        sys.stdout.write("\n"); sys.stdout.flush()
+
 def main():
     ap = argparse.ArgumentParser(prog="mrc-agent")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -506,6 +809,11 @@ def main():
     p_te.add_argument("--controller", required=True)
     p_te.add_argument("--timeout", type=float, default=5.0)
     p_te.set_defaults(func=cmd_test)
+
+    p_mon = sub.add_parser("monitor", help="live TUI: flows, ACKs, retr, per-path attribution")
+    p_mon.add_argument("--state", default=DEFAULT_STATE)
+    p_mon.add_argument("--interval", type=float, default=0.5)
+    p_mon.set_defaults(func=cmd_monitor)
 
     args = ap.parse_args()
     args.func(args)

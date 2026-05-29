@@ -182,17 +182,31 @@ do_verify() {
 # ---- demo ------------------------------------------------------------------
 do_demo() {
   local CURL="curl -sf -m 2 -H Content-Type:application/json"
+  local URL="http://localhost:${CTRL_PORT}/api/profile"
   show_route() { docker exec host00 ip -6 route show 2001:db8:cccc:01::2 2>/dev/null | sed 's/^/    /'; }
-  echo "== 1. srv6 + single path via spine00 =="
-  $CURL -X POST "http://localhost:${CTRL_PORT}/api/profile" -d '{"mode":"srv6","active_paths":["via-p0-spine00"]}' >/dev/null
-  sleep 1; echo "   host00 route to host01:"; show_route
-  echo; echo "== 2. DENY spine00 — agent re-steers within a tick =="
-  $CURL -X POST "http://localhost:${CTRL_PORT}/api/path/via-p0-spine00/status" -d '{"status":"deny"}' >/dev/null
-  sleep 1; echo "   host00 route to host01:"; show_route
-  echo; echo "== 3. restore + spray BOTH spines (multipath ECMP) =="
-  $CURL -X POST "http://localhost:${CTRL_PORT}/api/path/via-p0-spine00/status" -d '{"status":"good"}' >/dev/null
-  $CURL -X POST "http://localhost:${CTRL_PORT}/api/profile" -d '{"active_paths":["via-p0-spine00","via-p0-spine01"]}' >/dev/null
-  sleep 1; echo "   host00 route to host01:"; show_route
+  show_mode()  { curl -sf -m 1 "http://localhost:${CTRL_PORT}/api/profile" | python3 -c "import sys,json;d=json.load(sys.stdin);print(f\"   mode={d['mode']}  multipath={d['multipath']}  active_paths={d['active_paths']}\")"; }
+
+  echo "== 1. NONE — plain RoCEv2, no MRC, kernel does standard L4-hash ECMP =="
+  $CURL -X POST "$URL" -d '{"mode":"none"}' >/dev/null; sleep 1
+  show_mode; echo "   host00 route to host01:"; show_route
+  echo;
+  echo "== 2. UDP — EV in UDP src port, app-driven; no kernel encap installed =="
+  $CURL -X POST "$URL" -d '{"mode":"udp","multipath":true,"active_paths":["via-p0-spine00","via-p0-spine01"]}' >/dev/null; sleep 1
+  show_mode; echo "   host00 route to host01 (should be plain — no encap):"; show_route
+  echo;
+  echo "== 3. STEV — structured entropy in UDP src port; same underlay =="
+  $CURL -X POST "$URL" -d '{"mode":"stev","multipath":true,"active_paths":["via-p0-spine00","via-p0-spine01"]}' >/dev/null; sleep 1
+  show_mode; echo "   host00 route to host01 (still plain):"; show_route
+  echo;
+  echo "== 4. SRv6 single path via spine00 — kernel encap installed =="
+  $CURL -X POST "$URL" -d '{"mode":"srv6","multipath":false,"active_paths":["via-p0-spine00"]}' >/dev/null; sleep 1
+  show_mode; echo "   host00 route to host01:"; show_route
+  echo;
+  echo "== 5. SRv6 multipath (spray both spines) — ECMP nexthops =="
+  $CURL -X POST "$URL" -d '{"mode":"srv6","multipath":true,"active_paths":["via-p0-spine00","via-p0-spine01"]}' >/dev/null; sleep 1
+  show_mode; echo "   host00 route to host01:"; show_route
+  echo;
+  echo "READY. Tip: run \`docker exec -it host00 mrc-agent monitor\` to see live per-mode telemetry."
 }
 
 # ---- login -----------------------------------------------------------------

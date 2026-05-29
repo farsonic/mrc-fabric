@@ -36,6 +36,7 @@ STATE = {
     "updated": time.time(),
 }
 MODES = {
+    "none": "Plain RoCEv2 — no MRC; underlay does standard L4-hash ECMP (MRC_CTL_EV_FMT_MODE_NONE)",
     "udp":  "ECMP-UDP — spray across ALL good paths (MRC_CTL_EV_FMT_MODE_UDP)",
     "stev": "Structured EV — pin the flow to ONE path (MRC_CTL_EV_FMT_MODE_STEV)",
     "srv6": "SRv6 uSID — explicit segment list(s); one or many paths (MRC_CTL_EV_FMT_MODE_SRV6)",
